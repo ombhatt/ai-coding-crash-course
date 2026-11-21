@@ -7,7 +7,7 @@ description: Database schema changes — generate the migration, update the seed
 
 The database is **disposable**. `data.db` is gitignored and holds nothing but seed data, so every schema change is free: migrate, throw the file away, reseed from scratch.
 
-Disposable is also why `scripts/seed.ts` is part of every schema change rather than a follow-up. The seed script is the definition of the starting data, and it recreates the whole database on each run — so a schema change that skips it produces data whose shape no longer matches the schema.
+Disposable is also why the seed (`scripts/seed.ts` and `scripts/seed-data.ts`) is part of every schema change rather than a follow-up. The seed script is the definition of the starting data, and it recreates the whole database on each run — so a schema change that skips it produces data whose shape no longer matches the schema.
 
 ## Steps
 
@@ -15,8 +15,8 @@ Disposable is also why `scripts/seed.ts` is part of every schema change rather t
 
 2. **Generate the migration** — `npm run db:generate`. This writes a new numbered SQL file into `drizzle/`. Read it and confirm it says what you intended.
 
-3. **Update `scripts/seed.ts`** for every table you touched:
-   - **New table** — add a `DROP TABLE IF EXISTS` line to the drop block at the top of `seed()`, positioned above the tables it has foreign keys into (children drop first), and insert rows for it.
+3. **Update the seed** for every table you touched. `scripts/seed.ts` holds the drop block; every insert lives in `seedDatabase()` in `scripts/seed-data.ts`:
+   - **New table** — add a `DROP TABLE IF EXISTS` line to the drop block in `scripts/seed.ts`, positioned above the tables it has foreign keys into (children drop first), and insert rows for it in `scripts/seed-data.ts`.
    - **New non-nullable column** — give it a value in every `.values({ ... })` call for that table.
    - **Renamed or removed column** — rename or remove it at every insert site for that table.
    - **New enum** — import it from `../app/db/schema` and use its members at the insert sites, matching how `UserRole` and `CourseStatus` are used.
@@ -36,7 +36,7 @@ rm -f data.db data.db-shm data.db-wal
 npm run db:seed
 ```
 
-Nothing is lost — the file is rebuilt from `drizzle/` and `scripts/seed.ts`.
+Nothing is lost — the file is rebuilt from `drizzle/` and the seed scripts.
 
 ## `npm run db:migrate`
 
