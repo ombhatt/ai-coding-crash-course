@@ -2,13 +2,23 @@ import { Link, isRouteErrorResponse, useSearchParams } from "react-router";
 import { z } from "zod";
 import type { Route } from "./+types/instructor.analytics";
 import { requireInstructorOrAdmin } from "~/lib/access.server";
-import { ANALYTICS_RANGES, type AnalyticsRange } from "~/lib/analytics";
+import {
+  ANALYTICS_RANGES,
+  type AnalyticsRange,
+  TOP_BUYER_LIMIT,
+} from "~/lib/analytics";
 import {
   type RevenueSeries,
+  getAudienceSummary,
+  getCourseRatings,
   getRevenueSeries,
   getRevenueSummary,
+  getTopBuyers,
+  getUnredeemedSeatCount,
   hasPublishedCourses,
 } from "~/services/analyticsService";
+import { countUnansweredQuestions } from "~/services/commentService";
+import { StarRating } from "~/components/star-rating";
 import { PLATFORM_FEE_PERCENT } from "~/lib/fees";
 import { Button } from "~/components/ui/button";
 import { Card, CardContent } from "~/components/ui/card";
@@ -21,7 +31,7 @@ import {
 } from "~/components/ui/chart";
 import { Bar, BarChart, CartesianGrid, XAxis, YAxis } from "recharts";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "~/components/ui/tabs";
-import { AlertTriangle, BarChart3, BookPlus } from "lucide-react";
+import { AlertTriangle, BarChart3, BookPlus, Users } from "lucide-react";
 import { cn, formatCents } from "~/lib/utils";
 
 // ─── Instructor Analytics ───
@@ -64,6 +74,11 @@ export async function loader({ request }: Route.LoaderArgs) {
     hasPublishedCourses: true as const,
     revenue: getRevenueSummary(userId, range),
     revenueSeries: getRevenueSeries(userId, range),
+    audience: getAudienceSummary(userId, range),
+    unredeemedSeats: getUnredeemedSeatCount(userId),
+    topBuyers: getTopBuyers(userId, range),
+    unansweredQuestions: countUnansweredQuestions(userId),
+    ratings: getCourseRatings(userId),
   };
 }
 
@@ -110,16 +125,19 @@ function RangeSelector({
   );
 }
 
-function RevenueFigure({
+function StatCard({
   label,
-  cents,
+  value,
   hint,
   emphasis = false,
+  children,
 }: {
   label: string;
-  cents: number;
+  value: React.ReactNode;
   hint: string;
   emphasis?: boolean;
+  /** Extra content under the hint, such as a call to action. */
+  children?: React.ReactNode;
 }) {
   return (
     <Card>
@@ -131,9 +149,214 @@ function RevenueFigure({
             !emphasis && "text-muted-foreground"
           )}
         >
-          {formatCents(cents)}
+          {value}
         </div>
         <p className="mt-1 text-xs text-muted-foreground">{hint}</p>
+        {children}
+      </CardContent>
+    </Card>
+  );
+}
+
+function SectionHeading({
+  id,
+  title,
+  scope,
+}: {
+  id: string;
+  title: string;
+  /** What the numbers cover: the selected range, or "all time". */
+  scope: string;
+}) {
+  return (
+    <h2 id={id} className="mb-3 text-lg font-semibold">
+      {title}{" "}
+      <span className="font-normal text-muted-foreground">· {scope}</span>
+    </h2>
+  );
+}
+
+type OverviewData = Extract<
+  Awaited<ReturnType<typeof loader>>,
+  { hasPublishedCourses: true }
+>;
+
+function AudiencePanel({
+  audience,
+  unredeemedSeats,
+}: Pick<OverviewData, "audience" | "unredeemedSeats">) {
+  return (
+    <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      <StatCard
+        label="Buyers"
+        value={audience.buyers}
+        hint={
+          audience.buyers === 0
+            ? "Nobody bought a course in this period yet."
+            : "People who paid, including team buyers."
+        }
+        emphasis
+      />
+      <StatCard
+        label="Students"
+        value={audience.students}
+        hint={
+          audience.students === 0
+            ? "Nobody enrolled in this period yet."
+            : "People who enrolled, including seat redeemers."
+        }
+        emphasis
+      />
+      <StatCard
+        label="Revenue per student"
+        value={
+          audience.students === 0
+            ? "—"
+            : formatCents(audience.revenuePerStudent)
+        }
+        hint={
+          audience.students === 0
+            ? "Shown once students enroll."
+            : "Team seats count at their share of the team price."
+        }
+      />
+      <StatCard
+        label="Unredeemed seats · all time"
+        value={unredeemedSeats}
+        hint={
+          unredeemedSeats === 0
+            ? "No team seats are waiting to be claimed."
+            : "Team seats paid for that nobody has claimed."
+        }
+      />
+    </div>
+  );
+}
+
+function TopBuyersPanel({ buyers }: { buyers: OverviewData["topBuyers"] }) {
+  if (buyers.length === 0) {
+    return (
+      <Card>
+        <CardContent className="py-10 text-center">
+          <Users className="mx-auto mb-3 size-10 text-muted-foreground" />
+          <p className="font-medium">No buyers in this period</p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Your biggest customers will be ranked here once people buy.
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <div className="overflow-x-auto rounded-md border">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="border-b bg-muted/50">
+            <th className="w-10 px-4 py-3 text-left font-medium">#</th>
+            <th className="px-4 py-3 text-left font-medium">Buyer</th>
+            <th className="px-4 py-3 text-left font-medium">Type</th>
+            <th className="px-4 py-3 text-right font-medium">Spent</th>
+          </tr>
+        </thead>
+        <tbody>
+          {buyers.map((buyer, index) => (
+            <tr key={buyer.userId} className="border-b last:border-0">
+              <td className="px-4 py-3 text-muted-foreground tabular-nums">
+                {index + 1}
+              </td>
+              <td className="px-4 py-3">
+                <div className="font-medium">{buyer.name}</div>
+                <div className="text-xs text-muted-foreground">
+                  {buyer.email}
+                  {!buyer.enrolled && " · not enrolled"}
+                </div>
+              </td>
+              <td className="px-4 py-3">
+                {buyer.seats > 0 ? (
+                  <span className="inline-flex flex-wrap items-center gap-2">
+                    <span className="inline-flex items-center rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-700 dark:bg-blue-900/30 dark:text-blue-400">
+                      Team · {buyer.seats}{" "}
+                      {buyer.seats === 1 ? "seat" : "seats"}
+                    </span>
+                    {buyer.unredeemedSeats > 0 && (
+                      <span className="text-xs text-muted-foreground">
+                        {buyer.unredeemedSeats} unredeemed
+                      </span>
+                    )}
+                  </span>
+                ) : (
+                  <span className="text-xs text-muted-foreground">
+                    Individual
+                  </span>
+                )}
+              </td>
+              <td className="px-4 py-3 text-right font-medium tabular-nums">
+                {formatCents(buyer.totalSpent)}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function QuestionsCard({ count }: { count: number }) {
+  return (
+    <StatCard
+      label="Unanswered questions"
+      value={count}
+      hint={
+        count === 0
+          ? "No student is waiting on you. Nice."
+          : "Students waiting on a reply from you."
+      }
+      emphasis
+    >
+      {count > 0 && (
+        <Link
+          to="/instructor/questions"
+          className="mt-3 inline-block text-sm font-medium underline-offset-4 hover:underline"
+        >
+          Answer questions →
+        </Link>
+      )}
+    </StatCard>
+  );
+}
+
+function RatingsCard({ ratings }: { ratings: OverviewData["ratings"] }) {
+  const anyRated = ratings.some((course) => course.count > 0);
+
+  return (
+    <Card>
+      <CardContent className="p-6">
+        <div className="text-sm font-medium text-muted-foreground">
+          Course ratings
+        </div>
+        {!anyRated ? (
+          <p className="mt-2 text-sm text-muted-foreground">
+            No ratings yet. They&apos;ll appear here as students rate your
+            courses.
+          </p>
+        ) : (
+          <ul className="mt-3 space-y-2">
+            {ratings.map((course) => (
+              <li
+                key={course.courseId}
+                className="flex items-center justify-between gap-4 text-sm"
+              >
+                <span className="truncate">{course.title}</span>
+                <StarRating
+                  average={course.average}
+                  count={course.count}
+                  className="shrink-0"
+                />
+              </li>
+            ))}
+          </ul>
+        )}
       </CardContent>
     </Card>
   );
@@ -270,7 +493,16 @@ export default function InstructorAnalytics({
     );
   }
 
-  const { revenue, revenueSeries } = loaderData;
+  const {
+    revenue,
+    revenueSeries,
+    audience,
+    unredeemedSeats,
+    topBuyers,
+    unansweredQuestions,
+    ratings,
+  } = loaderData;
+  const scope = RANGE_LABELS[range].toLowerCase();
 
   return (
     <div className="mx-auto max-w-5xl p-6 lg:p-8">
@@ -293,37 +525,83 @@ export default function InstructorAnalytics({
 
         <TabsContent value="overview">
           <section aria-labelledby="revenue-heading">
-            <h2 id="revenue-heading" className="mb-3 text-lg font-semibold">
-              Revenue · {RANGE_LABELS[range].toLowerCase()}
-            </h2>
+            <SectionHeading
+              id="revenue-heading"
+              title="Revenue"
+              scope={scope}
+            />
             <div className="grid gap-4 sm:grid-cols-3">
-              <RevenueFigure
+              <StatCard
                 label="Gross revenue"
-                cents={revenue.gross}
-                hint="Everything buyers paid for your courses."
+                value={formatCents(revenue.gross)}
+                hint={
+                  revenue.gross === 0
+                    ? "No sales in this period yet."
+                    : "Everything buyers paid for your courses."
+                }
               />
-              <RevenueFigure
+              <StatCard
                 label={`Platform fee (${PLATFORM_FEE_PERCENT}%)`}
-                cents={revenue.fee}
-                hint="The platform's cut of gross revenue."
+                value={formatCents(revenue.fee)}
+                hint={
+                  revenue.gross === 0
+                    ? "Nothing to take a cut of yet."
+                    : "The platform's cut of gross revenue."
+                }
               />
-              <RevenueFigure
+              <StatCard
                 label="Net earnings"
-                cents={revenue.net}
-                hint="Gross minus the platform fee. Not a payout."
+                value={formatCents(revenue.net)}
+                hint={
+                  revenue.gross === 0
+                    ? "Earnings appear here once you make a sale."
+                    : "Gross minus the platform fee. Not a payout."
+                }
                 emphasis
               />
             </div>
           </section>
 
           <section aria-labelledby="revenue-over-time-heading" className="mt-8">
-            <h2
+            <SectionHeading
               id="revenue-over-time-heading"
-              className="mb-3 text-lg font-semibold"
-            >
-              Revenue over time
-            </h2>
+              title="Revenue over time"
+              scope={scope}
+            />
             <RevenueChart series={revenueSeries} />
+          </section>
+
+          <section aria-labelledby="audience-heading" className="mt-8">
+            <SectionHeading
+              id="audience-heading"
+              title="Buyers & students"
+              scope={scope}
+            />
+            <AudiencePanel
+              audience={audience}
+              unredeemedSeats={unredeemedSeats}
+            />
+          </section>
+
+          <section aria-labelledby="top-buyers-heading" className="mt-8">
+            <SectionHeading
+              id="top-buyers-heading"
+              title={`Top ${TOP_BUYER_LIMIT} buyers`}
+              scope={scope}
+            />
+            <TopBuyersPanel buyers={topBuyers} />
+          </section>
+
+          <section aria-labelledby="attention-heading" className="mt-8">
+            <SectionHeading
+              id="attention-heading"
+              title="Needs your attention"
+              scope="all time"
+            />
+            <div className="grid gap-4 md:grid-cols-2">
+              <QuestionsCard count={unansweredQuestions} />
+              <RatingsCard ratings={ratings} />
+            </div>
           </section>
         </TabsContent>
 
@@ -360,6 +638,20 @@ export function HydrateFallback() {
       </div>
       <Skeleton className="mb-3 mt-8 h-6 w-40" />
       <Skeleton className="h-[306px] w-full" />
+      <Skeleton className="mb-3 mt-8 h-6 w-56" />
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <Skeleton className="h-32 w-full" />
+        <Skeleton className="h-32 w-full" />
+        <Skeleton className="h-32 w-full" />
+        <Skeleton className="h-32 w-full" />
+      </div>
+      <Skeleton className="mb-3 mt-8 h-6 w-48" />
+      <Skeleton className="h-96 w-full" />
+      <Skeleton className="mb-3 mt-8 h-6 w-64" />
+      <div className="grid gap-4 md:grid-cols-2">
+        <Skeleton className="h-40 w-full" />
+        <Skeleton className="h-40 w-full" />
+      </div>
     </div>
   );
 }

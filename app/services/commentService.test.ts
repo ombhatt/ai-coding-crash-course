@@ -21,6 +21,7 @@ import {
   getLessonThread,
   getCommentCountForLesson,
   getUnansweredQuestions,
+  countUnansweredQuestions,
   getCourseForLesson,
 } from "./commentService";
 
@@ -492,6 +493,21 @@ describe("commentService", () => {
       expect(getUnansweredQuestions(base.instructor.id).map((q) => q.body)).toEqual(
         ["Newer", "Older"]
       );
+    });
+  });
+
+  describe("countUnansweredQuestions", () => {
+    it("counts only the instructor's questions still waiting on staff", () => {
+      createComment(base.user.id, lesson.id, null, "Waiting");
+      createComment(base.user.id, lesson.id, null, "Also waiting");
+      const answered = createComment(base.user.id, lesson.id, null, "Done");
+      createComment(base.instructor.id, lesson.id, answered.id, "Answer");
+
+      expect(countUnansweredQuestions(base.instructor.id)).toBe(2);
+    });
+
+    it("is zero, not an error, when nothing is waiting", () => {
+      expect(countUnansweredQuestions(base.instructor.id)).toBe(0);
     });
   });
 

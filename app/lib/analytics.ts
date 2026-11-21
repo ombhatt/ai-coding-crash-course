@@ -5,3 +5,6 @@
 
 export const ANALYTICS_RANGES = ["7d", "30d", "90d", "all"] as const;
 export type AnalyticsRange = (typeof ANALYTICS_RANGES)[number];
+
+/** How many buyers the top-buyer leaderboard shows. */
+export const TOP_BUYER_LIMIT = 10;

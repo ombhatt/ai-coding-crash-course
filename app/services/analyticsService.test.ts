@@ -14,6 +14,10 @@ vi.mock("~/db", () => ({
 }));
 
 import {
+  getAudienceSummary,
+  getCourseRatings,
+  getTopBuyers,
+  getUnredeemedSeatCount,
   getRevenueSeries,
   getRevenueSummary,
   hasPublishedCourses,
@@ -262,5 +266,249 @@ describe("getRevenueSeries", () => {
     expect(
       getRevenueSeries(addInstructor("idle@example.com").id, "all").points
     ).toEqual([]);
+  });
+});
+
+// ─── Audience fixture ───
+// A solo buyer who enrolled, and a team buyer who bought seats for others and
+// never enrolled themselves; some of those seats are redeemed.
+
+function addStudent(email: string) {
+  return testDb
+    .insert(schema.users)
+    .values({ name: email, email, role: schema.UserRole.Student })
+    .returning()
+    .get();
+}
+
+function enroll(userId: number, courseId: number, enrolledAt = daysAgo(1)) {
+  testDb
+    .insert(schema.enrollments)
+    .values({ userId, courseId, enrolledAt })
+    .run();
+}
+
+/** An individual purchase, which also enrolls the buyer. */
+function buyAndEnroll(
+  userId: number,
+  courseId: number,
+  amountPaid: number,
+  at = daysAgo(1)
+) {
+  testDb
+    .insert(schema.purchases)
+    .values({ userId, courseId, amountPaid, createdAt: at })
+    .run();
+  enroll(userId, courseId, at);
+}
+
+/**
+ * One purchase row paying for `seats` coupons. The buyer is not enrolled;
+ * each redeemer gets a coupon and an enrollment, with no purchase of their own.
+ */
+function buyTeamSeats(
+  buyerId: number,
+  courseId: number,
+  amountPaid: number,
+  seats: number,
+  redeemerIds: number[],
+  at = daysAgo(1)
+) {
+  const purchase = testDb
+    .insert(schema.purchases)
+    .values({ userId: buyerId, courseId, amountPaid, createdAt: at })
+    .returning()
+    .get();
+  const team = testDb.insert(schema.teams).values({}).returning().get();
+  for (let seat = 0; seat < seats; seat++) {
+    const redeemerId = redeemerIds[seat];
+    testDb
+      .insert(schema.coupons)
+      .values({
+        teamId: team.id,
+        courseId,
+        purchaseId: purchase.id,
+        code: `T${purchase.id}-${seat}`,
+        redeemedByUserId: redeemerId ?? null,
+        redeemedAt: redeemerId ? at : null,
+      })
+      .run();
+    if (redeemerId) enroll(redeemerId, courseId, at);
+  }
+}
+
+describe("getAudienceSummary", () => {
+  function seedTeamScenario() {
+    const ann = addStudent("ann@example.com");
+    const tom = addStudent("tom@example.com");
+    const ria = addStudent("ria@example.com");
+    const raj = addStudent("raj@example.com");
+    buyAndEnroll(ann.id, base.course.id, 5000);
+    buyTeamSeats(tom.id, base.course.id, 16000, 4, [ria.id, raj.id]);
+    return { ann, tom, ria, raj };
+  }
+
+  it("counts buyers and students separately when team seats exist", () => {
+    seedTeamScenario();
+
+    const audience = getAudienceSummary(base.instructor.id, "all");
+
+    // Buyers: Ann and Tom. Students: Ann, Ria and Raj — Tom never enrolled.
+    expect(audience.buyers).toBe(2);
+    expect(audience.students).toBe(3);
+  });
+
+  it("credits seat redeemers with their share of the team purchase", () => {
+    seedTeamScenario();
+
+    // Ann paid 5000 herself; Ria and Raj each hold one of four $160 seats, so
+    // 4000 each. (5000 + 4000 + 4000) / 3 students = 4333.33. Counting only
+    // students' own purchases would give 5000 / 3 = 1667.
+    expect(
+      getAudienceSummary(base.instructor.id, "all").revenuePerStudent
+    ).toBe(4333);
+  });
+
+  it("counts only buyers and students from inside the range", () => {
+    seedTeamScenario(); // all a day ago
+    const early = addStudent("early@example.com");
+    buyAndEnroll(early.id, base.course.id, 9000, daysAgo(60));
+
+    expect(getAudienceSummary(base.instructor.id, "30d")).toMatchObject({
+      buyers: 2,
+      students: 3,
+    });
+    expect(getAudienceSummary(base.instructor.id, "90d")).toMatchObject({
+      buyers: 3,
+      students: 4,
+    });
+  });
+
+  it("returns zeroes, not NaN, for an instructor with no audience", () => {
+    const idle = addInstructor("idle@example.com");
+
+    expect(getAudienceSummary(idle.id, "all")).toEqual({
+      buyers: 0,
+      students: 0,
+      revenuePerStudent: 0,
+    });
+    expect(getUnredeemedSeatCount(idle.id)).toBe(0);
+  });
+});
+
+describe("getUnredeemedSeatCount", () => {
+  it("counts seats bought but not yet redeemed", () => {
+    const tom = addStudent("tom@example.com");
+    const ria = addStudent("ria@example.com");
+    const raj = addStudent("raj@example.com");
+    buyTeamSeats(tom.id, base.course.id, 16000, 4, [ria.id, raj.id]);
+    const other = addStudent("other@example.com");
+    buyTeamSeats(other.id, base.course.id, 3000, 3, []);
+
+    // Tom's team: 4 seats, 2 redeemed. The other team: 3 seats, none redeemed.
+    expect(getUnredeemedSeatCount(base.instructor.id)).toBe(5);
+  });
+
+  it("ignores seats on other instructors' courses", () => {
+    const other = addCourse(addInstructor("x@example.com").id, "theirs");
+    buyTeamSeats(addStudent("buyer@example.com").id, other.id, 3000, 3, []);
+
+    expect(getUnredeemedSeatCount(base.instructor.id)).toBe(0);
+  });
+});
+
+describe("getTopBuyers", () => {
+  it("ranks buyers by spend, including a team buyer who never enrolled", () => {
+    const ann = addStudent("ann@example.com");
+    const tom = addStudent("tom@example.com");
+    const ria = addStudent("ria@example.com");
+    buyAndEnroll(ann.id, base.course.id, 5000);
+    buyTeamSeats(tom.id, base.course.id, 16000, 4, [ria.id]);
+
+    expect(getTopBuyers(base.instructor.id, "all")).toEqual([
+      {
+        userId: tom.id,
+        name: "tom@example.com",
+        email: "tom@example.com",
+        totalSpent: 16000,
+        seats: 4,
+        unredeemedSeats: 3,
+        enrolled: false,
+      },
+      {
+        userId: ann.id,
+        name: "ann@example.com",
+        email: "ann@example.com",
+        totalSpent: 5000,
+        seats: 0,
+        unredeemedSeats: 0,
+        enrolled: true,
+      },
+    ]);
+  });
+
+  it("sums a buyer's spend across the instructor's courses only", () => {
+    const ann = addStudent("ann@example.com");
+    const second = addCourse(base.instructor.id, "second-course");
+    const elsewhere = addCourse(addInstructor("x@example.com").id, "elsewhere");
+    buyAndEnroll(ann.id, base.course.id, 5000);
+    buyAndEnroll(ann.id, second.id, 2500);
+    buyAndEnroll(ann.id, elsewhere.id, 99999);
+
+    expect(getTopBuyers(base.instructor.id, "all")).toMatchObject([
+      { userId: ann.id, totalSpent: 7500 },
+    ]);
+  });
+
+  it("caps the leaderboard at the 10 biggest spenders in the range", () => {
+    for (let i = 1; i <= 12; i++) {
+      const buyer = addStudent(`buyer${i}@example.com`);
+      buyAndEnroll(buyer.id, base.course.id, i * 100);
+    }
+    const old = addStudent("old@example.com");
+    buyAndEnroll(old.id, base.course.id, 1_000_000, daysAgo(60));
+
+    const top = getTopBuyers(base.instructor.id, "30d");
+
+    expect(top.map((b) => b.totalSpent)).toEqual([
+      1200, 1100, 1000, 900, 800, 700, 600, 500, 400, 300,
+    ]);
+  });
+
+  it("is empty for an instructor with no sales", () => {
+    expect(getTopBuyers(base.instructor.id, "all")).toEqual([]);
+  });
+});
+
+describe("getCourseRatings", () => {
+  let raters: number;
+  beforeEach(() => {
+    raters = 0;
+  });
+
+  function rate(courseId: number, rating: number) {
+    const rater = addStudent(`rater${++raters}@example.com`);
+    testDb
+      .insert(schema.courseRatings)
+      .values({ userId: rater.id, courseId, rating })
+      .run();
+  }
+
+  it("lists each published course's average and count, unrated ones included", () => {
+    const second = addCourse(base.instructor.id, "second-course");
+    rate(base.course.id, 5);
+    rate(base.course.id, 4);
+    rate(base.course.id, 4);
+    rate(addCourse(addInstructor("x@example.com").id, "theirs").id, 1);
+
+    expect(getCourseRatings(base.instructor.id)).toEqual([
+      {
+        courseId: base.course.id,
+        title: "Test Course",
+        average: 4.3,
+        count: 3,
+      },
+      { courseId: second.id, title: "second-course", average: null, count: 0 },
+    ]);
   });
 });

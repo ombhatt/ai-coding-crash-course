@@ -279,9 +279,56 @@ export type QueuedQuestion = {
 export function getUnansweredQuestions(
   instructorId: number | null
 ): QueuedQuestion[] {
-  const author = alias(users, "author");
+  return db
+    .select({
+      id: comments.id,
+      body: comments.body,
+      createdAt: comments.createdAt,
+      lessonId: lessons.id,
+      lessonTitle: lessons.title,
+      courseTitle: courses.title,
+      courseSlug: courses.slug,
+      authorId: questionAuthor.id,
+      authorName: questionAuthor.name,
+      authorAvatarUrl: questionAuthor.avatarUrl,
+    })
+    .from(comments)
+    .innerJoin(questionAuthor, eq(comments.userId, questionAuthor.id))
+    .innerJoin(lessons, eq(comments.lessonId, lessons.id))
+    .innerJoin(modules, eq(lessons.moduleId, modules.id))
+    .innerJoin(courses, eq(modules.courseId, courses.id))
+    .where(isUnanswered(instructorId))
+    .orderBy(desc(comments.createdAt), desc(comments.id))
+    .all();
+}
+
+/**
+ * How many questions getUnansweredQuestions would return, counted in SQL —
+ * for dashboards that show the number, not the queue.
+ */
+export function countUnansweredQuestions(instructorId: number | null): number {
+  const row = db
+    .select({ count: sql<number>`count(*)` })
+    .from(comments)
+    .innerJoin(questionAuthor, eq(comments.userId, questionAuthor.id))
+    .innerJoin(lessons, eq(comments.lessonId, lessons.id))
+    .innerJoin(modules, eq(lessons.moduleId, modules.id))
+    .innerJoin(courses, eq(modules.courseId, courses.id))
+    .where(isUnanswered(instructorId))
+    .get();
+  return row?.count ?? 0;
+}
+
+const questionAuthor = alias(users, "author");
+
+/**
+ * The definition of "unanswered", shared by the queue and the count. Expects
+ * comments joined to questionAuthor and, via lessons and modules, to courses.
+ */
+function isUnanswered(instructorId: number | null) {
   const reply = alias(comments, "reply");
   const replyAuthor = alias(users, "reply_author");
+  const author = questionAuthor;
 
   // Correlated: matches a live reply, by staff, to the outer question.
   const staffReply = db
@@ -312,25 +359,5 @@ export function getUnansweredQuestions(
     conditions.push(eq(courses.instructorId, instructorId));
   }
 
-  return db
-    .select({
-      id: comments.id,
-      body: comments.body,
-      createdAt: comments.createdAt,
-      lessonId: lessons.id,
-      lessonTitle: lessons.title,
-      courseTitle: courses.title,
-      courseSlug: courses.slug,
-      authorId: author.id,
-      authorName: author.name,
-      authorAvatarUrl: author.avatarUrl,
-    })
-    .from(comments)
-    .innerJoin(author, eq(comments.userId, author.id))
-    .innerJoin(lessons, eq(comments.lessonId, lessons.id))
-    .innerJoin(modules, eq(lessons.moduleId, modules.id))
-    .innerJoin(courses, eq(modules.courseId, courses.id))
-    .where(and(...conditions))
-    .orderBy(desc(comments.createdAt), desc(comments.id))
-    .all();
+  return and(...conditions);
 }
