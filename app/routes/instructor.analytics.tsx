@@ -2,9 +2,10 @@ import { Link, isRouteErrorResponse, useSearchParams } from "react-router";
 import { z } from "zod";
 import type { Route } from "./+types/instructor.analytics";
 import { requireInstructorOrAdmin } from "~/lib/access.server";
+import { ANALYTICS_RANGES, type AnalyticsRange } from "~/lib/analytics";
 import {
-  ANALYTICS_RANGES,
-  type AnalyticsRange,
+  type RevenueSeries,
+  getRevenueSeries,
   getRevenueSummary,
   hasPublishedCourses,
 } from "~/services/analyticsService";
@@ -12,6 +13,13 @@ import { PLATFORM_FEE_PERCENT } from "~/lib/fees";
 import { Button } from "~/components/ui/button";
 import { Card, CardContent } from "~/components/ui/card";
 import { Skeleton } from "~/components/ui/skeleton";
+import {
+  type ChartConfig,
+  ChartContainer,
+  ChartTooltip,
+  ChartTooltipContent,
+} from "~/components/ui/chart";
+import { Bar, BarChart, CartesianGrid, XAxis, YAxis } from "recharts";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "~/components/ui/tabs";
 import { AlertTriangle, BarChart3, BookPlus } from "lucide-react";
 import { cn, formatCents } from "~/lib/utils";
@@ -55,6 +63,7 @@ export async function loader({ request }: Route.LoaderArgs) {
     range,
     hasPublishedCourses: true as const,
     revenue: getRevenueSummary(userId, range),
+    revenueSeries: getRevenueSeries(userId, range),
   };
 }
 
@@ -130,6 +139,104 @@ function RevenueFigure({
   );
 }
 
+const revenueChartConfig = {
+  gross: { label: "Gross revenue", color: "var(--chart-1)" },
+} satisfies ChartConfig;
+
+/** Axis and tooltip labels for a bucket's first day (`YYYY-MM-DD`, UTC). */
+function formatBucket(
+  start: string,
+  granularity: RevenueSeries["granularity"],
+  long = false
+) {
+  const date = new Date(`${start}T00:00:00.000Z`);
+  if (granularity === "month") {
+    return date.toLocaleDateString("en-US", {
+      month: "short",
+      year: "numeric",
+      timeZone: "UTC",
+    });
+  }
+  const day = date.toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    timeZone: "UTC",
+  });
+  return granularity === "week" && long ? `Week of ${day}` : day;
+}
+
+function RevenueChart({ series }: { series: RevenueSeries }) {
+  if (series.points.length === 0) {
+    return (
+      <Card>
+        <CardContent className="flex h-64 flex-col items-center justify-center text-center">
+          <BarChart3 className="mb-3 size-10 text-muted-foreground" />
+          <p className="font-medium">No sales in this period</p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Revenue will be charted here as purchases come in. Try a longer time
+            range.
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <Card>
+      <CardContent className="p-6">
+        <ChartContainer
+          config={revenueChartConfig}
+          className="aspect-auto h-64 w-full"
+        >
+          <BarChart data={series.points} accessibilityLayer>
+            <CartesianGrid vertical={false} />
+            <XAxis
+              dataKey="start"
+              tickLine={false}
+              axisLine={false}
+              tickMargin={8}
+              minTickGap={24}
+              tickFormatter={(start: string) =>
+                formatBucket(start, series.granularity)
+              }
+            />
+            <YAxis
+              tickLine={false}
+              axisLine={false}
+              width={56}
+              tickFormatter={(cents: number) =>
+                `$${(cents / 100).toLocaleString("en-US", { maximumFractionDigits: 0 })}`
+              }
+            />
+            <ChartTooltip
+              cursor={false}
+              content={
+                <ChartTooltipContent
+                  labelFormatter={(_, payload) => {
+                    const start = payload[0]?.payload.start;
+                    return start
+                      ? formatBucket(start, series.granularity, true)
+                      : null;
+                  }}
+                  formatter={(value) => (
+                    <div className="flex w-full justify-between gap-4">
+                      <span className="text-muted-foreground">Gross</span>
+                      <span className="font-mono font-medium tabular-nums">
+                        {formatCents(Number(value))}
+                      </span>
+                    </div>
+                  )}
+                />
+              }
+            />
+            <Bar dataKey="gross" fill="var(--color-gross)" radius={4} />
+          </BarChart>
+        </ChartContainer>
+      </CardContent>
+    </Card>
+  );
+}
+
 function NoPublishedCourses() {
   return (
     <Card>
@@ -137,8 +244,8 @@ function NoPublishedCourses() {
         <BookPlus className="mx-auto mb-4 size-12 text-muted-foreground" />
         <p className="font-medium">Publish your first course</p>
         <p className="mx-auto mt-1 max-w-md text-sm text-muted-foreground">
-          Analytics start once you have a published course. Sales, students,
-          and progress will show up here as soon as people find it.
+          Analytics start once you have a published course. Sales, students, and
+          progress will show up here as soon as people find it.
         </p>
         <Link to="/instructor/new" className="mt-6 inline-block">
           <Button>Create a course</Button>
@@ -163,7 +270,7 @@ export default function InstructorAnalytics({
     );
   }
 
-  const { revenue } = loaderData;
+  const { revenue, revenueSeries } = loaderData;
 
   return (
     <div className="mx-auto max-w-5xl p-6 lg:p-8">
@@ -208,6 +315,16 @@ export default function InstructorAnalytics({
               />
             </div>
           </section>
+
+          <section aria-labelledby="revenue-over-time-heading" className="mt-8">
+            <h2
+              id="revenue-over-time-heading"
+              className="mb-3 text-lg font-semibold"
+            >
+              Revenue over time
+            </h2>
+            <RevenueChart series={revenueSeries} />
+          </section>
         </TabsContent>
 
         <TabsContent value="course">
@@ -241,6 +358,8 @@ export function HydrateFallback() {
         <Skeleton className="h-32 w-full" />
         <Skeleton className="h-32 w-full" />
       </div>
+      <Skeleton className="mb-3 mt-8 h-6 w-40" />
+      <Skeleton className="h-[306px] w-full" />
     </div>
   );
 }
