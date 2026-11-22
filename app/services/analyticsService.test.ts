@@ -189,6 +189,128 @@ describe("hasPublishedCourses", () => {
   });
 });
 
+describe("across all instructors (null filter)", () => {
+  it("sums revenue across every instructor's courses", () => {
+    const other = addInstructor("other@example.com");
+    addPurchase(base.course.id, 5000);
+    addPurchase(addCourse(other.id, "other-course").id, 3000);
+
+    expect(getRevenueSummary(null, "all")).toEqual({
+      gross: 8000,
+      fee: 1600,
+      net: 6400,
+    });
+  });
+
+  it("charts every instructor's sales in the same buckets", () => {
+    const other = addInstructor("other@example.com");
+    addPurchase(base.course.id, 500, "2026-06-15T09:00:00.000Z");
+    addPurchase(
+      addCourse(other.id, "other-course").id,
+      250,
+      "2026-06-15T01:00:00.000Z"
+    );
+
+    expect(getRevenueSeries(null, "7d").points.at(-1)).toEqual({
+      start: "2026-06-15",
+      gross: 750,
+    });
+  });
+
+  it("has published courses when any instructor does", () => {
+    const idle = addInstructor("idle@example.com");
+    expect(hasPublishedCourses(idle.id)).toBe(false);
+    expect(hasPublishedCourses(null)).toBe(true);
+
+    // Every course on the platform back to draft.
+    testDb
+      .update(schema.courses)
+      .set({ status: schema.CourseStatus.Draft })
+      .run();
+
+    expect(hasPublishedCourses(null)).toBe(false);
+  });
+
+  it("counts each buyer and student once across every instructor", () => {
+    const otherCourse = addCourse(
+      addInstructor("other@example.com").id,
+      "other-course"
+    );
+    const ann = addStudent("ann@example.com");
+    const bob = addStudent("bob@example.com");
+    // Ann buys from both instructors; Bob from the other one only.
+    buyAndEnroll(ann.id, base.course.id, 5000);
+    buyAndEnroll(ann.id, otherCourse.id, 3000);
+    buyAndEnroll(bob.id, otherCourse.id, 1000);
+
+    // 9000 across 2 distinct students.
+    expect(getAudienceSummary(null, "all")).toEqual({
+      buyers: 2,
+      students: 2,
+      revenuePerStudent: 4500,
+    });
+  });
+
+  it("counts unredeemed seats on every instructor's courses", () => {
+    const otherCourse = addCourse(
+      addInstructor("other@example.com").id,
+      "other-course"
+    );
+    const ria = addStudent("ria@example.com");
+    buyTeamSeats(addStudent("tom@example.com").id, base.course.id, 9000, 3, [
+      ria.id,
+    ]);
+    buyTeamSeats(addStudent("una@example.com").id, otherCourse.id, 4000, 2, []);
+
+    // 2 left on Tom's team, 2 on Una's.
+    expect(getUnredeemedSeatCount(null)).toBe(4);
+  });
+
+  it("ranks buyers by their spend across every instructor", () => {
+    const otherCourse = addCourse(
+      addInstructor("other@example.com").id,
+      "other-course"
+    );
+    const ann = addStudent("ann@example.com");
+    const bob = addStudent("bob@example.com");
+    // Ann enrolled only with the other instructor; Bob only with base's.
+    buyAndEnroll(ann.id, base.course.id, 4000);
+    testDb
+      .delete(schema.enrollments)
+      .where(eq(schema.enrollments.userId, ann.id))
+      .run();
+    buyAndEnroll(ann.id, otherCourse.id, 3000);
+    buyAndEnroll(bob.id, base.course.id, 6000);
+
+    expect(getTopBuyers(null, "all")).toMatchObject([
+      { userId: ann.id, totalSpent: 7000, enrolled: true },
+      { userId: bob.id, totalSpent: 6000, enrolled: true },
+    ]);
+  });
+
+  it("lists every instructor's published courses in the ratings", () => {
+    const otherCourse = addCourse(
+      addInstructor("other@example.com").id,
+      "other-course"
+    );
+
+    expect(getCourseRatings(null)).toEqual([
+      {
+        courseId: base.course.id,
+        title: "Test Course",
+        average: null,
+        count: 0,
+      },
+      {
+        courseId: otherCourse.id,
+        title: "other-course",
+        average: null,
+        count: 0,
+      },
+    ]);
+  });
+});
+
 describe("getRevenueSeries", () => {
   // NOW is Monday 2026-06-15, 12:00 UTC.
 

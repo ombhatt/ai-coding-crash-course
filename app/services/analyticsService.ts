@@ -20,6 +20,9 @@ import {
 // Aggregates behind the analytics page. Every figure is grouped SQL over the
 // instructor's courses — never a loop over per-student helpers — so the page
 // doesn't degrade as an audience grows.
+//
+// Every function takes an instructorId, or null for every instructor's courses
+// at once — the platform-wide view admins get.
 
 const RANGE_DAYS: Record<AnalyticsRange, number | null> = {
   "7d": 7,
@@ -46,7 +49,7 @@ export type RevenueSummary = {
 };
 
 export function getRevenueSummary(
-  instructorId: number,
+  instructorId: number | null,
   range: AnalyticsRange
 ): RevenueSummary {
   const row = db
@@ -65,13 +68,20 @@ export function getRevenueSummary(
 
 /** Purchases of the instructor's courses at or after the cutoff (inclusive). */
 function instructorPurchasesInRange(
-  instructorId: number,
+  instructorId: number | null,
   cutoff: string | null
 ) {
   return and(
-    eq(courses.instructorId, instructorId),
+    ownedBy(instructorId),
     cutoff ? gte(purchases.createdAt, cutoff) : undefined
   );
+}
+
+/** Courses taught by the instructor; no condition at all for null (everyone). */
+function ownedBy(instructorId: number | null) {
+  return instructorId === null
+    ? undefined
+    : eq(courses.instructorId, instructorId);
 }
 
 // ─── Revenue over time ───
@@ -96,7 +106,7 @@ export type RevenueSeries = {
 };
 
 export function getRevenueSeries(
-  instructorId: number,
+  instructorId: number | null,
   range: AnalyticsRange
 ): RevenueSeries {
   const granularity = RANGE_GRANULARITY[range];
@@ -154,15 +164,12 @@ function nextBucket(start: string, granularity: RevenueGranularity): string {
  * Whether the instructor has anything live. The page shows "publish your first
  * course" instead of a wall of zeroes when this is false.
  */
-export function hasPublishedCourses(instructorId: number): boolean {
+export function hasPublishedCourses(instructorId: number | null): boolean {
   const row = db
     .select({ id: courses.id })
     .from(courses)
     .where(
-      and(
-        eq(courses.instructorId, instructorId),
-        eq(courses.status, CourseStatus.Published)
-      )
+      and(ownedBy(instructorId), eq(courses.status, CourseStatus.Published))
     )
     .limit(1)
     .get();
@@ -187,7 +194,7 @@ export type AudienceSummary = {
 };
 
 export function getAudienceSummary(
-  instructorId: number,
+  instructorId: number | null,
   range: AnalyticsRange
 ): AudienceSummary {
   const cutoff = rangeCutoff(range);
@@ -208,7 +215,7 @@ export function getAudienceSummary(
     .innerJoin(courses, eq(courses.id, enrollments.courseId))
     .where(
       and(
-        eq(courses.instructorId, instructorId),
+        ownedBy(instructorId),
         cutoff ? gte(enrollments.enrolledAt, cutoff) : undefined
       )
     )
@@ -264,17 +271,12 @@ function seatsOn(purchaseId: AnyColumn, { unredeemed = false } = {}) {
  * current count with no meaningful date, so it ignores the range — the page
  * labels it "all time".
  */
-export function getUnredeemedSeatCount(instructorId: number): number {
+export function getUnredeemedSeatCount(instructorId: number | null): number {
   const row = db
     .select({ count: sql<number>`count(*)` })
     .from(coupons)
     .innerJoin(courses, eq(courses.id, coupons.courseId))
-    .where(
-      and(
-        eq(courses.instructorId, instructorId),
-        isNull(coupons.redeemedByUserId)
-      )
-    )
+    .where(and(ownedBy(instructorId), isNull(coupons.redeemedByUserId)))
     .get();
   return row?.count ?? 0;
 }
@@ -291,7 +293,10 @@ export type TopBuyer = {
   seats: number;
   /** Of those seats, how many nobody has redeemed yet. */
   unredeemedSeats: number;
-  /** Whether they're enrolled in any of the instructor's courses themselves. */
+  /**
+   * Whether they're enrolled in any of the instructor's courses themselves (any
+   * course at all, for the all-instructors view).
+   */
   enrolled: boolean;
 };
 
@@ -301,7 +306,7 @@ export type TopBuyer = {
  * largest customer — still appears.
  */
 export function getTopBuyers(
-  instructorId: number,
+  instructorId: number | null,
   range: AnalyticsRange
 ): TopBuyer[] {
   const totalSpent = sql<number>`sum(${purchases.amountPaid})`;
@@ -320,7 +325,7 @@ export function getTopBuyers(
         sql<boolean>`exists (select 1 from ${enrollments} ${ownEnrollment}
         join ${courses} ${enrolledCourse} on ${enrolledCourse.id} = ${ownEnrollment.courseId}
         where ${ownEnrollment.userId} = ${users.id}
-          and ${enrolledCourse.instructorId} = ${instructorId})`.mapWith(
+          ${instructorId === null ? sql`` : sql`and ${enrolledCourse.instructorId} = ${instructorId}`})`.mapWith(
           Boolean
         ),
     })
@@ -344,15 +349,12 @@ export type CourseRating = CourseRatingSummary & {
 };
 
 /** Rating summary for each of the instructor's published courses. */
-export function getCourseRatings(instructorId: number): CourseRating[] {
+export function getCourseRatings(instructorId: number | null): CourseRating[] {
   const published = db
     .select({ courseId: courses.id, title: courses.title })
     .from(courses)
     .where(
-      and(
-        eq(courses.instructorId, instructorId),
-        eq(courses.status, CourseStatus.Published)
-      )
+      and(ownedBy(instructorId), eq(courses.status, CourseStatus.Published))
     )
     .orderBy(courses.id)
     .all();

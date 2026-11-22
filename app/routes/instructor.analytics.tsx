@@ -18,11 +18,20 @@ import {
   hasPublishedCourses,
 } from "~/services/analyticsService";
 import { countUnansweredQuestions } from "~/services/commentService";
+import { getUsersByRole } from "~/services/userService";
+import { UserRole } from "~/db/schema";
 import { StarRating } from "~/components/star-rating";
 import { PLATFORM_FEE_PERCENT } from "~/lib/fees";
 import { Button } from "~/components/ui/button";
 import { Card, CardContent } from "~/components/ui/card";
 import { Skeleton } from "~/components/ui/skeleton";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "~/components/ui/select";
 import {
   type ChartConfig,
   ChartContainer,
@@ -38,13 +47,21 @@ import { cn, formatCents } from "~/lib/utils";
 // "How is my teaching business doing?" on one page. Tab and range live in the
 // URL so a view can be bookmarked or shared; the loader reads them, the
 // analytics service does all the arithmetic, and this module only renders.
+//
+// Admins also pick whose numbers to see — one instructor, or every instructor
+// at once — via the `instructor` param. Instructors always see their own; the
+// loader ignores the param for them.
 
 const TABS = ["overview", "course"] as const;
-type AnalyticsTab = (typeof TABS)[number];
+const ALL_INSTRUCTORS = "all";
 
 const searchSchema = z.object({
   tab: z.enum(TABS).catch("overview"),
   range: z.enum(ANALYTICS_RANGES).catch("30d"),
+  /** Admins only: an instructor's id, or "all" for the whole platform. */
+  instructor: z
+    .union([z.literal(ALL_INSTRUCTORS), z.coerce.number().int().positive()])
+    .catch(ALL_INSTRUCTORS),
 });
 
 const RANGE_LABELS: Record<AnalyticsRange, string> = {
@@ -59,47 +76,123 @@ export function meta() {
 }
 
 export async function loader({ request }: Route.LoaderArgs) {
-  const { userId } = await requireInstructorOrAdmin(request);
-  const { tab, range } = searchSchema.parse(
+  const { userId, isAdmin } = await requireInstructorOrAdmin(request);
+  const search = searchSchema.parse(
     Object.fromEntries(new URL(request.url).searchParams)
   );
+  const { tab, range } = search;
 
-  if (!hasPublishedCourses(userId)) {
-    return { tab, range, hasPublishedCourses: false as const };
+  // Whose numbers to show: always your own as an instructor. An admin gets the
+  // instructor they picked, or everyone (null) — also when the id in the URL
+  // isn't an instructor.
+  const instructors = isAdmin
+    ? getUsersByRole(UserRole.Instructor)
+        .map(({ id, name }) => ({ id, name }))
+        .sort((a, b) => a.name.localeCompare(b.name))
+    : null;
+  const picked = instructors?.find((i) => i.id === search.instructor) ?? null;
+  const instructorId = isAdmin ? (picked?.id ?? null) : userId;
+  const view = {
+    tab,
+    range,
+    /** The admin picker's options; null for instructors, who get no picker. */
+    instructors,
+    /** The picked instructor, or null for all instructors (or yourself). */
+    picked,
+  };
+
+  if (!hasPublishedCourses(instructorId)) {
+    return { ...view, hasPublishedCourses: false as const };
   }
 
   return {
-    tab,
-    range,
+    ...view,
     hasPublishedCourses: true as const,
-    revenue: getRevenueSummary(userId, range),
-    revenueSeries: getRevenueSeries(userId, range),
-    audience: getAudienceSummary(userId, range),
-    unredeemedSeats: getUnredeemedSeatCount(userId),
-    topBuyers: getTopBuyers(userId, range),
-    unansweredQuestions: countUnansweredQuestions(userId),
-    ratings: getCourseRatings(userId),
+    revenue: getRevenueSummary(instructorId, range),
+    revenueSeries: getRevenueSeries(instructorId, range),
+    audience: getAudienceSummary(instructorId, range),
+    unredeemedSeats: getUnredeemedSeatCount(instructorId),
+    topBuyers: getTopBuyers(instructorId, range),
+    unansweredQuestions: countUnansweredQuestions(instructorId),
+    ratings: getCourseRatings(instructorId),
   };
 }
 
-function PageHeader() {
+type ViewData = Pick<
+  Awaited<ReturnType<typeof loader>>,
+  "instructors" | "picked"
+>;
+
+function PageHeader({ instructors, picked }: ViewData) {
+  let subtitle = "How your courses are selling, across everything you teach.";
+  if (instructors) {
+    subtitle = picked
+      ? `How ${picked.name}'s courses are selling.`
+      : "How courses are selling across every instructor on the platform.";
+  }
+
   return (
-    <div className="mb-6">
-      <h1 className="text-3xl font-bold">Analytics</h1>
-      <p className="mt-1 text-muted-foreground">
-        How your courses are selling, across everything you teach.
-      </p>
+    <div className="mb-6 flex flex-wrap items-start justify-between gap-3">
+      <div>
+        <h1 className="text-3xl font-bold">Analytics</h1>
+        <p className="mt-1 text-muted-foreground">{subtitle}</p>
+      </div>
+      {instructors && (
+        <InstructorPicker instructors={instructors} picked={picked} />
+      )}
     </div>
   );
 }
 
-function RangeSelector({
-  range,
-  tab,
+/** Admins only. Writes the choice to the URL, which the loader reads. */
+function InstructorPicker({
+  instructors,
+  picked,
 }: {
-  range: AnalyticsRange;
-  tab: AnalyticsTab;
+  instructors: NonNullable<ViewData["instructors"]>;
+  picked: ViewData["picked"];
 }) {
+  const [, setSearchParams] = useSearchParams();
+
+  return (
+    <Select
+      value={picked ? String(picked.id) : ALL_INSTRUCTORS}
+      onValueChange={(next) =>
+        setSearchParams(
+          (params) => {
+            params.set("instructor", next);
+            return params;
+          },
+          { preventScrollReset: true }
+        )
+      }
+    >
+      <SelectTrigger className="w-56" aria-label="Instructor">
+        {/* Explicit, so the server render shows the choice before hydration. */}
+        <SelectValue>{picked ? picked.name : "All instructors"}</SelectValue>
+      </SelectTrigger>
+      <SelectContent>
+        <SelectItem value={ALL_INSTRUCTORS}>All instructors</SelectItem>
+        {instructors.map((instructor) => (
+          <SelectItem key={instructor.id} value={String(instructor.id)}>
+            {instructor.name}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
+}
+
+function RangeSelector({ range }: { range: AnalyticsRange }) {
+  // Keeps the other params (tab, instructor) so a range change is the only
+  // thing that moves.
+  const [searchParams] = useSearchParams();
+  const linkTo = (option: AnalyticsRange) => {
+    const params = new URLSearchParams(searchParams);
+    params.set("range", option);
+    return `?${params}`;
+  };
+
   return (
     <nav
       aria-label="Time range"
@@ -108,7 +201,7 @@ function RangeSelector({
       {ANALYTICS_RANGES.map((option) => (
         <Link
           key={option}
-          to={`?tab=${tab}&range=${option}`}
+          to={linkTo(option)}
           preventScrollReset
           aria-current={option === range ? "page" : undefined}
           className={cn(
@@ -460,7 +553,26 @@ function RevenueChart({ series }: { series: RevenueSeries }) {
   );
 }
 
-function NoPublishedCourses() {
+function NoPublishedCourses({ instructors, picked }: ViewData) {
+  if (instructors) {
+    // An admin looking at someone else's (or nobody's) courses — there's
+    // nothing for them to publish here.
+    return (
+      <Card>
+        <CardContent className="py-12 text-center">
+          <BookPlus className="mx-auto mb-4 size-12 text-muted-foreground" />
+          <p className="font-medium">No published courses</p>
+          <p className="mx-auto mt-1 max-w-md text-sm text-muted-foreground">
+            {picked
+              ? `${picked.name} hasn't published a course yet.`
+              : "No instructor has published a course yet."}{" "}
+            Analytics start once a course is live.
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+
   return (
     <Card>
       <CardContent className="py-12 text-center">
@@ -481,14 +593,14 @@ function NoPublishedCourses() {
 export default function InstructorAnalytics({
   loaderData,
 }: Route.ComponentProps) {
-  const { tab, range } = loaderData;
+  const { tab, range, instructors, picked } = loaderData;
   const [, setSearchParams] = useSearchParams();
 
   if (!loaderData.hasPublishedCourses) {
     return (
       <div className="mx-auto max-w-5xl p-6 lg:p-8">
-        <PageHeader />
-        <NoPublishedCourses />
+        <PageHeader instructors={instructors} picked={picked} />
+        <NoPublishedCourses instructors={instructors} picked={picked} />
       </div>
     );
   }
@@ -506,12 +618,18 @@ export default function InstructorAnalytics({
 
   return (
     <div className="mx-auto max-w-5xl p-6 lg:p-8">
-      <PageHeader />
+      <PageHeader instructors={instructors} picked={picked} />
 
       <Tabs
         value={tab}
         onValueChange={(next) =>
-          setSearchParams({ tab: next, range }, { preventScrollReset: true })
+          setSearchParams(
+            (params) => {
+              params.set("tab", next);
+              return params;
+            },
+            { preventScrollReset: true }
+          )
         }
         className="gap-6"
       >
@@ -520,7 +638,7 @@ export default function InstructorAnalytics({
             <TabsTrigger value="overview">Overview</TabsTrigger>
             <TabsTrigger value="course">Course detail</TabsTrigger>
           </TabsList>
-          <RangeSelector range={range} tab={tab} />
+          <RangeSelector range={range} />
         </div>
 
         <TabsContent value="overview">
