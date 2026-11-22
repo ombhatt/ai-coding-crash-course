@@ -18,6 +18,8 @@ import {
   getAudienceSummary,
   getCourseCompletion,
   getCourseRatings,
+  getQuizPassRates,
+  getRevenueByCountry,
   getTopBuyers,
   getUnredeemedSeatCount,
   getRevenueSeries,
@@ -807,5 +809,250 @@ describe("course detail for all instructors (admins)", () => {
       averageProgress: 0,
       finished: 0,
     });
+  });
+});
+
+describe("getQuizPassRates", () => {
+  /** A quiz on its own lesson, in a new module of the course. */
+  function addQuiz(courseId: number, title: string, position = 1) {
+    const module = testDb
+      .insert(schema.modules)
+      .values({ courseId, title: `Module ${position}`, position })
+      .returning()
+      .get();
+    const lesson = testDb
+      .insert(schema.lessons)
+      .values({ moduleId: module.id, title: `${title} lesson`, position: 1 })
+      .returning()
+      .get();
+    return testDb
+      .insert(schema.quizzes)
+      .values({ lessonId: lesson.id, title, passingScore: 0.7 })
+      .returning()
+      .get();
+  }
+
+  function attempt(
+    userId: number,
+    quizId: number,
+    passed: boolean,
+    attemptedAt = daysAgo(1)
+  ) {
+    testDb
+      .insert(schema.quizAttempts)
+      .values({ userId, quizId, score: passed ? 1 : 0, passed, attemptedAt })
+      .run();
+  }
+
+  it("rates a quiz by who passed first time, and who passed in the end", () => {
+    const quiz = addQuiz(base.course.id, "Generics quiz");
+    const natural = addStudent("natural@example.com");
+    const retaker = addStudent("retaker@example.com");
+    const stuck = addStudent("stuck@example.com");
+    attempt(natural.id, quiz.id, true, daysAgo(5));
+    attempt(retaker.id, quiz.id, false, daysAgo(5));
+    attempt(retaker.id, quiz.id, true, daysAgo(4));
+    attempt(stuck.id, quiz.id, false, daysAgo(5));
+    attempt(stuck.id, quiz.id, false, daysAgo(4));
+
+    // 1 of 3 passed on their first attempt; 2 of 3 have passed by now.
+    expect(getQuizPassRates(base.instructor.id, base.course.id)).toEqual([
+      {
+        quizId: quiz.id,
+        title: "Generics quiz",
+        lessonTitle: "Generics quiz lesson",
+        students: 3,
+        firstAttemptPassRate: 33,
+        passRate: 67,
+      },
+    ]);
+  });
+
+  it("takes the earliest attempt as the first, whatever order it was recorded in", () => {
+    const quiz = addQuiz(base.course.id, "Generics quiz");
+    const student = addStudent("student@example.com");
+    attempt(student.id, quiz.id, true, daysAgo(2));
+    attempt(student.id, quiz.id, false, daysAgo(3));
+
+    expect(getQuizPassRates(base.instructor.id, base.course.id)).toMatchObject([
+      { students: 1, firstAttemptPassRate: 0, passRate: 100 },
+    ]);
+  });
+
+  it("lists every quiz of this course in course order, unattempted ones at zero", () => {
+    const later = addQuiz(base.course.id, "Later quiz", 2);
+    const earlier = addQuiz(base.course.id, "Earlier quiz", 1);
+    const elsewhere = addQuiz(
+      addCourse(base.instructor.id, "other-course").id,
+      "Elsewhere quiz"
+    );
+    const student = addStudent("student@example.com");
+    attempt(student.id, later.id, true);
+    attempt(student.id, elsewhere.id, false);
+
+    expect(getQuizPassRates(base.instructor.id, base.course.id)).toMatchObject([
+      {
+        quizId: earlier.id,
+        students: 0,
+        firstAttemptPassRate: 0,
+        passRate: 0,
+      },
+      {
+        quizId: later.id,
+        students: 1,
+        firstAttemptPassRate: 100,
+        passRate: 100,
+      },
+    ]);
+  });
+
+  it("is empty for a course with no quizzes", () => {
+    expect(getQuizPassRates(base.instructor.id, base.course.id)).toEqual([]);
+  });
+
+  it("is null for a course that isn't the instructor's, unless viewing everyone", () => {
+    const theirs = addCourse(addInstructor("x@example.com").id, "theirs");
+    addQuiz(theirs.id, "Their quiz");
+
+    expect(getQuizPassRates(base.instructor.id, theirs.id)).toBeNull();
+    expect(getQuizPassRates(null, theirs.id)).toHaveLength(1);
+  });
+});
+
+describe("getRevenueByCountry", () => {
+  function buyFrom(
+    courseId: number,
+    country: string | null,
+    amountPaid: number,
+    createdAt = daysAgo(1)
+  ) {
+    testDb
+      .insert(schema.purchases)
+      .values({
+        userId: base.user.id,
+        courseId,
+        amountPaid,
+        country,
+        createdAt,
+      })
+      .run();
+  }
+
+  it("splits the course's gross by country, PPP-discounted and full price adding up to it", () => {
+    buyFrom(base.course.id, "US", 5000);
+    buyFrom(base.course.id, "US", 5000);
+    buyFrom(base.course.id, "IN", 2500); // 50% off
+    buyFrom(base.course.id, "BR", 10500); // a team of three at 30% off
+    buyFrom(base.course.id, null, 5000);
+
+    const revenue = getRevenueByCountry(
+      base.instructor.id,
+      base.course.id,
+      "all"
+    )!;
+
+    expect(revenue).toEqual({
+      gross: 28000,
+      pppDiscountedGross: 13000,
+      fullPriceGross: 15000,
+      countries: [
+        {
+          country: "BR",
+          name: "Brazil",
+          purchases: 1,
+          gross: 10500,
+          pppDiscountPercent: 30,
+        },
+        {
+          country: "US",
+          name: "United States",
+          purchases: 2,
+          gross: 10000,
+          pppDiscountPercent: 0,
+        },
+        {
+          country: null,
+          name: "Unknown",
+          purchases: 1,
+          gross: 5000,
+          pppDiscountPercent: 0,
+        },
+        {
+          country: "IN",
+          name: "India",
+          purchases: 1,
+          gross: 2500,
+          pppDiscountPercent: 50,
+        },
+      ],
+    });
+    const countriesTotal = revenue.countries.reduce((s, c) => s + c.gross, 0);
+    expect(countriesTotal).toBe(revenue.gross);
+    expect(revenue.pppDiscountedGross + revenue.fullPriceGross).toBe(
+      revenue.gross
+    );
+  });
+
+  it("counts nothing as discounted on a course with PPP pricing off", () => {
+    testDb
+      .update(schema.courses)
+      .set({ pppEnabled: false })
+      .where(eq(schema.courses.id, base.course.id))
+      .run();
+    buyFrom(base.course.id, "IN", 5000);
+
+    expect(
+      getRevenueByCountry(base.instructor.id, base.course.id, "all")
+    ).toMatchObject({
+      gross: 5000,
+      pppDiscountedGross: 0,
+      fullPriceGross: 5000,
+      countries: [{ country: "IN", pppDiscountPercent: 0 }],
+    });
+  });
+
+  it.each([
+    ["7d", 1],
+    ["30d", 1 + 20],
+    ["all", 1 + 20 + 300],
+  ] as const)(
+    "counts only this course's purchases inside %s",
+    (range, expected) => {
+      buyFrom(base.course.id, "US", 1, daysAgo(3));
+      buyFrom(base.course.id, "IN", 20, daysAgo(20));
+      buyFrom(base.course.id, "US", 300, daysAgo(200));
+      buyFrom(addCourse(base.instructor.id, "other").id, "US", 4000);
+
+      const revenue = getRevenueByCountry(
+        base.instructor.id,
+        base.course.id,
+        range
+      )!;
+      expect(revenue.gross).toBe(expected);
+      expect(revenue.pppDiscountedGross + revenue.fullPriceGross).toBe(
+        expected
+      );
+    }
+  );
+
+  it("is all zeroes, not NaN, for a course with no sales", () => {
+    expect(
+      getRevenueByCountry(base.instructor.id, base.course.id, "all")
+    ).toEqual({
+      gross: 0,
+      pppDiscountedGross: 0,
+      fullPriceGross: 0,
+      countries: [],
+    });
+  });
+
+  it("is null for a course that isn't the instructor's, unless viewing everyone", () => {
+    const theirs = addCourse(addInstructor("x@example.com").id, "theirs");
+    buyFrom(theirs.id, "US", 5000);
+
+    expect(
+      getRevenueByCountry(base.instructor.id, theirs.id, "all")
+    ).toBeNull();
+    expect(getRevenueByCountry(null, theirs.id, "all")?.gross).toBe(5000);
   });
 });
