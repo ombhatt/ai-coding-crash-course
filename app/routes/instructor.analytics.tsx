@@ -12,6 +12,7 @@ import {
   getAnalyticsCourses,
   getAudienceSummary,
   getCourseCompletion,
+  getCourseDropOff,
   getCourseRatings,
   getRevenueSeries,
   getRevenueSummary,
@@ -137,6 +138,7 @@ export async function loader({ request }: Route.LoaderArgs) {
     courses,
     selectedCourseId: selectedCourse.id,
     completion: getCourseCompletion(instructorId, selectedCourse.id),
+    dropOff: getCourseDropOff(instructorId, selectedCourse.id),
   };
 }
 
@@ -657,6 +659,113 @@ function CompletionPanel({
   );
 }
 
+function EmptyCard({ title, body }: { title: string; body: string }) {
+  return (
+    <Card>
+      <CardContent className="py-10 text-center">
+        <GraduationCap className="mx-auto mb-3 size-10 text-muted-foreground" />
+        <p className="font-medium">{title}</p>
+        <p className="mt-1 text-sm text-muted-foreground">{body}</p>
+      </CardContent>
+    </Card>
+  );
+}
+
+/**
+ * One bar per lesson, grouped by module: how many enrollees got at least that
+ * far. The number beside each bar is how many stopped there; the biggest is
+ * highlighted, since that's the lesson to look at first.
+ */
+function DropOffPanel({ dropOff }: { dropOff: OverviewData["dropOff"] }) {
+  if (!dropOff || dropOff.enrollees === 0) {
+    return (
+      <EmptyCard
+        title="No students yet"
+        body="Once students enroll, you'll see how far through the course they get."
+      />
+    );
+  }
+  if (dropOff.modules.length === 0) {
+    return (
+      <EmptyCard
+        title="No lessons yet"
+        body="Add lessons to this course to see where students stop."
+      />
+    );
+  }
+
+  const { enrollees, neverStarted, modules } = dropOff;
+  const biggestDrop = Math.max(
+    ...modules.flatMap((m) => m.lessons.map((l) => l.drop))
+  );
+  const percent = (count: number) => (100 * count) / enrollees;
+
+  return (
+    <Card>
+      <CardContent className="p-6">
+        <p className="mb-5 text-sm text-muted-foreground">
+          Each bar counts the {enrollees}{" "}
+          {enrollees === 1 ? "student" : "students"} enrolled who reached at
+          least that lesson. The number beside it is how many stopped there.
+          {neverStarted > 0 && ` ${neverStarted} never started a lesson.`}
+        </p>
+        <div className="space-y-6">
+          {modules.map((module) => (
+            <div key={module.id}>
+              <div className="mb-2 flex items-baseline justify-between gap-3 border-b pb-1">
+                <h3 className="font-medium">{module.title}</h3>
+                <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
+                  {module.reached} reached · {module.drop} stopped here
+                </span>
+              </div>
+              <ol className="space-y-1.5">
+                {module.lessons.map((lesson) => {
+                  const isBiggest =
+                    biggestDrop > 0 && lesson.drop === biggestDrop;
+                  return (
+                    <li
+                      key={lesson.id}
+                      className="grid grid-cols-[minmax(0,14rem)_1fr_2.5rem_3.5rem] items-center gap-3 text-sm"
+                    >
+                      <span className="truncate" title={lesson.title}>
+                        {lesson.title}
+                      </span>
+                      <div className="h-2 rounded-full bg-muted">
+                        <div
+                          className="h-2 rounded-full bg-primary"
+                          style={{ width: `${percent(lesson.reached)}%` }}
+                        />
+                      </div>
+                      <span className="text-right tabular-nums">
+                        {lesson.reached}
+                      </span>
+                      <span
+                        className={cn(
+                          "text-right tabular-nums",
+                          isBiggest
+                            ? "font-semibold text-destructive"
+                            : "text-muted-foreground"
+                        )}
+                        title={
+                          isBiggest
+                            ? "The most students stopped here"
+                            : undefined
+                        }
+                      >
+                        {lesson.drop > 0 ? `−${lesson.drop}` : "–"}
+                      </span>
+                    </li>
+                  );
+                })}
+              </ol>
+            </div>
+          ))}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 function NoPublishedCourses({ instructors, picked }: ViewData) {
   if (instructors) {
     // An admin looking at someone else's (or nobody's) courses — there's
@@ -720,6 +829,7 @@ export default function InstructorAnalytics({
     courses,
     selectedCourseId,
     completion,
+    dropOff,
   } = loaderData;
   const scope = RANGE_LABELS[range].toLowerCase();
   const course = String(selectedCourseId);
@@ -853,6 +963,15 @@ export default function InstructorAnalytics({
               scope="all time"
             />
             <CompletionPanel completion={completion} />
+          </section>
+
+          <section aria-labelledby="drop-off-heading" className="mt-8">
+            <SectionHeading
+              id="drop-off-heading"
+              title="Drop-off"
+              scope="all time"
+            />
+            <DropOffPanel dropOff={dropOff} />
           </section>
         </TabsContent>
       </Tabs>

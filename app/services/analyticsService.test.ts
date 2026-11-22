@@ -17,6 +17,7 @@ import {
   getAnalyticsCourses,
   getAudienceSummary,
   getCourseCompletion,
+  getCourseDropOff,
   getCourseRatings,
   getTopBuyers,
   getUnredeemedSeatCount,
@@ -784,6 +785,205 @@ describe("getCourseCompletion", () => {
       enrollees: 0,
       averageProgress: 0,
       finished: 0,
+    });
+  });
+});
+
+describe("getCourseDropOff", () => {
+  /** A module of lessons, in the order given; returns the lesson ids. */
+  function addModule(
+    courseId: number,
+    position: number,
+    lessonTitles: string[]
+  ) {
+    const module = testDb
+      .insert(schema.modules)
+      .values({ courseId, title: `Module ${position}`, position })
+      .returning()
+      .get();
+    return lessonTitles.map(
+      (title, i) =>
+        testDb
+          .insert(schema.lessons)
+          .values({ moduleId: module.id, title, position: i + 1 })
+          .returning()
+          .get().id
+    );
+  }
+
+  /** An enrolled student with a progress record on each of `lessonIds`. */
+  function student(
+    email: string,
+    lessonIds: number[],
+    status = schema.LessonProgressStatus.Completed
+  ) {
+    const user = addStudent(email);
+    enroll(user.id, base.course.id);
+    for (const lessonId of lessonIds) {
+      testDb
+        .insert(schema.lessonProgress)
+        .values({ userId: user.id, lessonId, status })
+        .run();
+    }
+    return user;
+  }
+
+  /** [title, reached, drop] per lesson, in course order. */
+  function bars(instructorId: number | null = base.instructor.id) {
+    return getCourseDropOff(instructorId, base.course.id)!.modules.flatMap(
+      (m) => m.lessons.map((l) => [l.title, l.reached, l.drop])
+    );
+  }
+
+  it("counts, per lesson, the enrollees who got at least that far", () => {
+    const [intro, setup] = addModule(base.course.id, 1, ["Intro", "Setup"]);
+    const [cliff, after] = addModule(base.course.id, 2, ["Cliff", "After"]);
+    student("all@example.com", [intro, setup, cliff, after]);
+    student("stuck1@example.com", [intro, setup, cliff]);
+    student("stuck2@example.com", [intro, setup]);
+    student("stuck3@example.com", [intro, setup, cliff]);
+    student("early@example.com", [intro]);
+    student("never@example.com", []);
+
+    // 6 enrolled, 5 started. Three get as far as Cliff and only one goes on:
+    // the drop beside each bar is who got that far and no further.
+    expect(bars()).toEqual([
+      ["Intro", 5, 1],
+      ["Setup", 4, 1],
+      ["Cliff", 3, 2],
+      ["After", 1, 0],
+    ]);
+    expect(getCourseDropOff(base.instructor.id, base.course.id)).toMatchObject({
+      enrollees: 6,
+      neverStarted: 1,
+    });
+  });
+
+  it("still counts a student at a lesson they skipped on the way past it", () => {
+    const [first, skipped] = addModule(base.course.id, 1, ["First", "Skipped"]);
+    const [later, last] = addModule(base.course.id, 2, ["Later", "Last"]);
+    student("skipper@example.com", [first, later]);
+    student("stayer@example.com", [first, skipped]);
+    student("jumper@example.com", [last]);
+
+    // Nobody dips back up: Skipped keeps everyone who went past it.
+    const reached = bars().map(([, count]) => count as number);
+    reached.forEach((count, i) =>
+      expect(count).toBeLessThanOrEqual(reached[i - 1] ?? count)
+    );
+    expect(bars()).toEqual([
+      ["First", 3, 0],
+      ["Skipped", 3, 1],
+      ["Later", 2, 1],
+      ["Last", 1, 0],
+    ]);
+  });
+
+  it("counts a lesson in progress as reached", () => {
+    const [one, two, three] = addModule(base.course.id, 1, ["1", "2", "3"]);
+    student("done@example.com", [one]);
+    student(
+      "midway@example.com",
+      [two],
+      schema.LessonProgressStatus.InProgress
+    );
+    student(
+      "ahead@example.com",
+      [three],
+      schema.LessonProgressStatus.InProgress
+    );
+
+    expect(bars()).toEqual([
+      ["1", 3, 1],
+      ["2", 2, 1],
+      ["3", 1, 0],
+    ]);
+  });
+
+  it("ignores progress from students not enrolled, and on other courses", () => {
+    const [one, two] = addModule(base.course.id, 1, ["1", "2"]);
+    const enrolled = student("enrolled@example.com", [one]);
+    const visitor = addStudent("visitor@example.com");
+    const other = addCourse(base.instructor.id, "other");
+    const [elsewhere] = addModule(other.id, 1, ["Elsewhere"]);
+    for (const [userId, lessonId] of [
+      [visitor.id, two],
+      [enrolled.id, elsewhere],
+    ]) {
+      testDb
+        .insert(schema.lessonProgress)
+        .values({
+          userId,
+          lessonId,
+          status: schema.LessonProgressStatus.Completed,
+        })
+        .run();
+    }
+
+    expect(bars()).toEqual([
+      ["1", 1, 1],
+      ["2", 0, 0],
+    ]);
+  });
+
+  it("subtotals each module: who reached it, and who stopped inside it", () => {
+    const [a1, a2] = addModule(base.course.id, 1, ["A1", "A2"]);
+    const [b1, b2] = addModule(base.course.id, 2, ["B1", "B2"]);
+    student("a1@example.com", [a1]);
+    student("a2@example.com", [a1, a2]);
+    student("b1@example.com", [a1, a2, b1]);
+    student("b2@example.com", [a1, a2, b1, b2]);
+    student("idle@example.com", []);
+
+    const modules = getCourseDropOff(
+      base.instructor.id,
+      base.course.id
+    )!.modules;
+    // Module 1: 4 of 5 start it; a1 and a2 stop there. Module 2: 2 reach it
+    // and b1 stops; b2 reached the end. idle never started at all.
+    expect(
+      modules.map(({ title, reached, drop }) => [title, reached, drop])
+    ).toEqual([
+      ["Module 1", 4, 2],
+      ["Module 2", 2, 1],
+    ]);
+  });
+
+  it("is null for a course that isn't the instructor's", () => {
+    const theirs = addCourse(addInstructor("x@example.com").id, "theirs");
+
+    expect(getCourseDropOff(base.instructor.id, theirs.id)).toBeNull();
+  });
+
+  it("shows any instructor's course to the all-instructors view", () => {
+    const theirs = addCourse(addInstructor("x@example.com").id, "theirs");
+    enroll(addStudent("student@example.com").id, theirs.id);
+
+    expect(getCourseDropOff(null, theirs.id)).toEqual({
+      enrollees: 1,
+      neverStarted: 1,
+      modules: [],
+    });
+  });
+
+  it("is all zeroes, not NaN, for a course nobody has enrolled in", () => {
+    addModule(base.course.id, 1, ["Only"]);
+    addModule(base.course.id, 2, []); // a module with no lessons yet
+
+    expect(getCourseDropOff(base.instructor.id, base.course.id)).toEqual({
+      enrollees: 0,
+      neverStarted: 0,
+      modules: [
+        {
+          id: expect.any(Number),
+          title: "Module 1",
+          reached: 0,
+          drop: 0,
+          lessons: [
+            { id: expect.any(Number), title: "Only", reached: 0, drop: 0 },
+          ],
+        },
+      ],
     });
   });
 });

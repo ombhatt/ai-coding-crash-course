@@ -1,4 +1,13 @@
-import { type AnyColumn, and, desc, eq, gte, isNull, sql } from "drizzle-orm";
+import {
+  type AnyColumn,
+  and,
+  desc,
+  eq,
+  gte,
+  inArray,
+  isNull,
+  sql,
+} from "drizzle-orm";
 import { alias } from "drizzle-orm/sqlite-core";
 import { db } from "~/db";
 import {
@@ -476,5 +485,164 @@ export function getCourseCompletion(
         ? 0
         : Math.round((100 * (row?.completedLessons ?? 0)) / possible),
     finished: row?.finished ?? 0,
+  };
+}
+
+// ─── Drop-off ───
+// Where students give up, from lesson progress records (not video events), so
+// all time like completion. A lesson's bar counts the enrollees who reached at
+// least that lesson — any progress on it or on a later one, in-progress
+// included. The series can only descend, so a skipped lesson never looks like
+// a lost student and a gap between neighbours is where people quit.
+
+export type DropOffLesson = {
+  id: number;
+  title: string;
+  /** Enrollees with progress on this lesson or any later one. */
+  reached: number;
+  /**
+   * Reached this lesson but none after it: where they stopped. Always 0 on
+   * the course's last lesson, since reaching it is getting to the end.
+   */
+  drop: number;
+};
+
+export type DropOffModule = {
+  id: number;
+  title: string;
+  /** Enrollees who reached the module's first lesson. */
+  reached: number;
+  /** Students who stopped inside the module: its lessons' drops summed. */
+  drop: number;
+  lessons: DropOffLesson[];
+};
+
+export type CourseDropOff = {
+  /** Everyone enrolled — the funnel's starting width. */
+  enrollees: number;
+  /** Enrollees with no progress on any lesson, so no lesson to pin them to. */
+  neverStarted: number;
+  /** In course order; modules without lessons are left out. */
+  modules: DropOffModule[];
+};
+
+/** Course order: module position, then lesson position; ids break ties. */
+const LESSON_ORDER = [
+  modules.position,
+  modules.id,
+  lessons.position,
+  lessons.id,
+];
+
+/**
+ * Null when the course isn't the instructor's, like getCourseCompletion. Only
+ * progress from students enrolled in the course counts.
+ */
+export function getCourseDropOff(
+  instructorId: number | null,
+  courseId: number
+): CourseDropOff | null {
+  const owned = db
+    .select({ id: courses.id })
+    .from(courses)
+    .where(and(eq(courses.id, courseId), ownedBy(instructorId)))
+    .get();
+  if (!owned) return null;
+
+  const courseLessons = db
+    .select({
+      id: lessons.id,
+      title: lessons.title,
+      moduleId: modules.id,
+      moduleTitle: modules.title,
+    })
+    .from(lessons)
+    .innerJoin(modules, eq(modules.id, lessons.moduleId))
+    .where(eq(modules.courseId, courseId))
+    .orderBy(...LESSON_ORDER)
+    .all();
+
+  const enrolled = db
+    .select({ userId: enrollments.userId })
+    .from(enrollments)
+    .where(eq(enrollments.courseId, courseId));
+  const enrollees =
+    db
+      .select({ count: sql<number>`count(distinct ${enrollments.userId})` })
+      .from(enrollments)
+      .where(eq(enrollments.courseId, courseId))
+      .get()?.count ?? 0;
+
+  // Each enrollee's furthest lesson as a 1-based position in course order,
+  // then how many students stopped at each position.
+  const ordered = db.$with("ordered").as(
+    db
+      .select({
+        lessonId: lessons.id,
+        ordinal: sql<number>`row_number() over (order by ${sql.join(
+          LESSON_ORDER,
+          sql`, `
+        )})`.as("ordinal"),
+      })
+      .from(lessons)
+      .innerJoin(modules, eq(modules.id, lessons.moduleId))
+      .where(eq(modules.courseId, courseId))
+  );
+  const furthest = db.$with("furthest").as(
+    db
+      .select({
+        ordinal: sql<number>`max(${ordered.ordinal})`.as("furthest_ordinal"),
+      })
+      .from(lessonProgress)
+      .innerJoin(ordered, eq(ordered.lessonId, lessonProgress.lessonId))
+      .where(inArray(lessonProgress.userId, enrolled))
+      .groupBy(lessonProgress.userId)
+  );
+  const stoppedAt = new Map(
+    db
+      .with(ordered, furthest)
+      .select({ ordinal: furthest.ordinal, students: sql<number>`count(*)` })
+      .from(furthest)
+      .groupBy(sql`${furthest.ordinal}`)
+      .all()
+      .map((row) => [row.ordinal, row.students])
+  );
+
+  // Reached lesson k = stopped at k or later: a running sum from the end.
+  const reached: number[] = [];
+  for (let i = courseLessons.length - 1, sum = 0; i >= 0; i--) {
+    sum += stoppedAt.get(i + 1) ?? 0;
+    reached[i] = sum;
+  }
+
+  const byModule = new Map<number, DropOffModule>();
+  const last = courseLessons.length - 1;
+  courseLessons.forEach((lesson, i) => {
+    // Stopping at the last lesson is getting to the end, not dropping off.
+    const drop = i === last ? 0 : (stoppedAt.get(i + 1) ?? 0);
+    let module = byModule.get(lesson.moduleId);
+    if (!module) {
+      module = {
+        id: lesson.moduleId,
+        title: lesson.moduleTitle,
+        reached: reached[i],
+        drop: 0,
+        lessons: [],
+      };
+      byModule.set(lesson.moduleId, module);
+    }
+    module.drop += drop;
+    module.lessons.push({
+      id: lesson.id,
+      title: lesson.title,
+      reached: reached[i],
+      drop,
+    });
+  });
+
+  return {
+    enrollees,
+    neverStarted: enrollees - (reached[0] ?? 0),
+    modules: [...byModule.values()],
   };
 }
