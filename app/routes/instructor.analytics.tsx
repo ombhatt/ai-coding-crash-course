@@ -9,7 +9,9 @@ import {
 } from "~/lib/analytics";
 import {
   type RevenueSeries,
+  getAnalyticsCourses,
   getAudienceSummary,
+  getCourseCompletion,
   getCourseRatings,
   getRevenueSeries,
   getRevenueSummary,
@@ -40,7 +42,15 @@ import {
 } from "~/components/ui/chart";
 import { Bar, BarChart, CartesianGrid, XAxis, YAxis } from "recharts";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "~/components/ui/tabs";
-import { AlertTriangle, BarChart3, BookPlus, Users } from "lucide-react";
+import {
+  AlertTriangle,
+  BarChart3,
+  BookPlus,
+  GraduationCap,
+  Users,
+} from "lucide-react";
+import { Label } from "~/components/ui/label";
+import { CourseStatus } from "~/db/schema";
 import { cn, formatCents } from "~/lib/utils";
 
 // ─── Instructor Analytics ───
@@ -62,6 +72,8 @@ const searchSchema = z.object({
   instructor: z
     .union([z.literal(ALL_INSTRUCTORS), z.coerce.number().int().positive()])
     .catch(ALL_INSTRUCTORS),
+  /** The Course detail tab's course; falls back to the default when invalid. */
+  course: z.coerce.number().int().optional().catch(undefined),
 });
 
 const RANGE_LABELS: Record<AnalyticsRange, string> = {
@@ -105,6 +117,13 @@ export async function loader({ request }: Route.LoaderArgs) {
     return { ...view, hasPublishedCourses: false as const };
   }
 
+  // An id that isn't among the viewed instructor's courses falls back to the
+  // default, so a hand-edited URL can't reach another instructor's course —
+  // and switching instructors never leaves a stale course selected.
+  const courses = getAnalyticsCourses(instructorId);
+  const selectedCourse =
+    courses.find((c) => c.id === search.course) ?? courses[0];
+
   return {
     ...view,
     hasPublishedCourses: true as const,
@@ -115,6 +134,9 @@ export async function loader({ request }: Route.LoaderArgs) {
     topBuyers: getTopBuyers(instructorId, range),
     unansweredQuestions: countUnansweredQuestions(instructorId),
     ratings: getCourseRatings(instructorId),
+    courses,
+    selectedCourseId: selectedCourse.id,
+    completion: getCourseCompletion(instructorId, selectedCourse.id),
   };
 }
 
@@ -553,6 +575,88 @@ function RevenueChart({ series }: { series: RevenueSeries }) {
   );
 }
 
+function CoursePicker({
+  courses,
+  value,
+  onChange,
+}: {
+  courses: OverviewData["courses"];
+  value: string;
+  onChange: (courseId: string) => void;
+}) {
+  return (
+    <div className="flex items-center gap-3">
+      <Label htmlFor="analytics-course">Course</Label>
+      <Select value={value} onValueChange={onChange}>
+        <SelectTrigger id="analytics-course" className="w-72">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {courses.map((course) => (
+            <SelectItem key={course.id} value={String(course.id)}>
+              {course.title}
+              {course.status !== CourseStatus.Published &&
+                ` (${course.status})`}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
+function CompletionPanel({
+  completion,
+}: {
+  completion: OverviewData["completion"];
+}) {
+  if (!completion || completion.enrollees === 0) {
+    return (
+      <Card>
+        <CardContent className="py-10 text-center">
+          <GraduationCap className="mx-auto mb-3 size-10 text-muted-foreground" />
+          <p className="font-medium">No students yet</p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Progress and completions will show here once students enroll in this
+            course.
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  const { enrollees, averageProgress, finished } = completion;
+  return (
+    <div className="grid gap-4 sm:grid-cols-2">
+      <StatCard
+        label="Average progress"
+        value={`${averageProgress}%`}
+        hint={`Share of lessons completed, averaged over all ${enrollees} ${
+          enrollees === 1 ? "student" : "students"
+        }.`}
+        emphasis
+      >
+        <div className="mt-3 h-1.5 rounded-full bg-muted">
+          <div
+            className="h-1.5 rounded-full bg-primary"
+            style={{ width: `${averageProgress}%` }}
+          />
+        </div>
+      </StatCard>
+      <StatCard
+        label="Finished"
+        value={finished}
+        hint={
+          finished === 0
+            ? "Nobody has finished this course yet."
+            : `Students who reached the end of the course, out of ${enrollees} enrolled.`
+        }
+        emphasis
+      />
+    </div>
+  );
+}
+
 function NoPublishedCourses({ instructors, picked }: ViewData) {
   if (instructors) {
     // An admin looking at someone else's (or nobody's) courses — there's
@@ -613,8 +717,12 @@ export default function InstructorAnalytics({
     topBuyers,
     unansweredQuestions,
     ratings,
+    courses,
+    selectedCourseId,
+    completion,
   } = loaderData;
   const scope = RANGE_LABELS[range].toLowerCase();
+  const course = String(selectedCourseId);
 
   return (
     <div className="mx-auto max-w-5xl p-6 lg:p-8">
@@ -724,15 +832,28 @@ export default function InstructorAnalytics({
         </TabsContent>
 
         <TabsContent value="course">
-          <Card>
-            <CardContent className="py-12 text-center">
-              <BarChart3 className="mx-auto mb-4 size-12 text-muted-foreground" />
-              <p className="font-medium">Course detail</p>
-              <p className="mt-1 text-sm text-muted-foreground">
-                Per-course progress and drop-off will appear here.
-              </p>
-            </CardContent>
-          </Card>
+          <CoursePicker
+            courses={courses}
+            value={course}
+            onChange={(next) =>
+              setSearchParams(
+                (params) => {
+                  params.set("course", next);
+                  return params;
+                },
+                { preventScrollReset: true }
+              )
+            }
+          />
+
+          <section aria-labelledby="completion-heading" className="mt-6">
+            <SectionHeading
+              id="completion-heading"
+              title="Completion"
+              scope="all time"
+            />
+            <CompletionPanel completion={completion} />
+          </section>
         </TabsContent>
       </Tabs>
     </div>

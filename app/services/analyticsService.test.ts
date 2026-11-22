@@ -14,7 +14,9 @@ vi.mock("~/db", () => ({
 }));
 
 import {
+  getAnalyticsCourses,
   getAudienceSummary,
+  getCourseCompletion,
   getCourseRatings,
   getTopBuyers,
   getUnredeemedSeatCount,
@@ -632,5 +634,178 @@ describe("getCourseRatings", () => {
       },
       { courseId: second.id, title: "second-course", average: null, count: 0 },
     ]);
+  });
+});
+
+describe("getAnalyticsCourses", () => {
+  function setStatus(courseId: number, status: schema.CourseStatus) {
+    testDb
+      .update(schema.courses)
+      .set({ status })
+      .where(eq(schema.courses.id, courseId))
+      .run();
+  }
+
+  it("lists all the instructor's own courses, published ones first, by title", () => {
+    const draft = addCourse(base.instructor.id, "a-draft");
+    setStatus(draft.id, schema.CourseStatus.Draft);
+    const archived = addCourse(base.instructor.id, "b-archived");
+    setStatus(archived.id, schema.CourseStatus.Archived);
+    const zebra = addCourse(base.instructor.id, "zebra");
+    const apple = addCourse(base.instructor.id, "apple");
+    addCourse(addInstructor("x@example.com").id, "theirs");
+
+    expect(getAnalyticsCourses(base.instructor.id)).toEqual([
+      { id: apple.id, title: "apple", status: "published" },
+      { id: base.course.id, title: "Test Course", status: "published" },
+      { id: zebra.id, title: "zebra", status: "published" },
+      { id: draft.id, title: "a-draft", status: "draft" },
+      { id: archived.id, title: "b-archived", status: "archived" },
+    ]);
+  });
+});
+
+describe("getCourseCompletion", () => {
+  /** A module holding `count` lessons on the course; returns the lesson ids. */
+  function addLessons(courseId: number, count: number) {
+    const module = testDb
+      .insert(schema.modules)
+      .values({ courseId, title: "Module", position: 1 })
+      .returning()
+      .get();
+    return Array.from(
+      { length: count },
+      (_, i) =>
+        testDb
+          .insert(schema.lessons)
+          .values({ moduleId: module.id, title: `Lesson ${i}`, position: i })
+          .returning()
+          .get().id
+    );
+  }
+
+  function progress(
+    userId: number,
+    lessonIds: number[],
+    status = schema.LessonProgressStatus.Completed
+  ) {
+    for (const lessonId of lessonIds) {
+      testDb
+        .insert(schema.lessonProgress)
+        .values({ userId, lessonId, status })
+        .run();
+    }
+  }
+
+  it("averages lesson progress over every enrollee, separately from who finished", () => {
+    const lessons = addLessons(base.course.id, 3);
+    const finisher = addStudent("finisher@example.com");
+    const partway = addStudent("partway@example.com");
+    const idle = addStudent("idle@example.com");
+    for (const student of [finisher, partway, idle]) {
+      enroll(student.id, base.course.id);
+    }
+    progress(finisher.id, lessons);
+    progress(partway.id, lessons.slice(0, 2));
+
+    // (3/3 + 2/3 + 0/3) / 3 = 55.6% on average, but only one finished.
+    expect(getCourseCompletion(base.instructor.id, base.course.id)).toEqual({
+      enrollees: 3,
+      averageProgress: 56,
+      finished: 1,
+    });
+  });
+
+  it("also counts an enrollment marked complete as finished", () => {
+    const lessons = addLessons(base.course.id, 2);
+    const marked = addStudent("marked@example.com");
+    testDb
+      .insert(schema.enrollments)
+      .values({
+        userId: marked.id,
+        courseId: base.course.id,
+        completedAt: daysAgo(1),
+      })
+      .run();
+    progress(marked.id, lessons.slice(0, 1));
+
+    expect(getCourseCompletion(base.instructor.id, base.course.id)).toEqual({
+      enrollees: 1,
+      averageProgress: 50,
+      finished: 1,
+    });
+  });
+
+  it("counts only completed lessons of this course, each once", () => {
+    const lessons = addLessons(base.course.id, 4);
+    const elsewhere = addLessons(
+      addCourse(base.instructor.id, "other-course").id,
+      4
+    );
+    const student = addStudent("student@example.com");
+    enroll(student.id, base.course.id);
+    progress(student.id, lessons.slice(0, 1));
+    progress(student.id, lessons.slice(0, 1)); // a duplicate record
+    progress(
+      student.id,
+      lessons.slice(1),
+      schema.LessonProgressStatus.InProgress
+    );
+    progress(student.id, elsewhere);
+
+    expect(getCourseCompletion(base.instructor.id, base.course.id)).toEqual({
+      enrollees: 1,
+      averageProgress: 25,
+      finished: 0,
+    });
+  });
+
+  it("doesn't call anyone finished on a course with no lessons yet", () => {
+    enroll(addStudent("early@example.com").id, base.course.id);
+
+    expect(getCourseCompletion(base.instructor.id, base.course.id)).toEqual({
+      enrollees: 1,
+      averageProgress: 0,
+      finished: 0,
+    });
+  });
+
+  it("is null for a course that isn't the instructor's", () => {
+    const theirs = addCourse(addInstructor("x@example.com").id, "theirs");
+    enroll(addStudent("student@example.com").id, theirs.id);
+
+    expect(getCourseCompletion(base.instructor.id, theirs.id)).toBeNull();
+  });
+
+  it("is all zeroes, not NaN, for a course nobody has enrolled in", () => {
+    addLessons(base.course.id, 3);
+
+    expect(getCourseCompletion(base.instructor.id, base.course.id)).toEqual({
+      enrollees: 0,
+      averageProgress: 0,
+      finished: 0,
+    });
+  });
+});
+
+describe("course detail for all instructors (admins)", () => {
+  it("offers every instructor's courses when no instructor is picked", () => {
+    const theirs = addCourse(addInstructor("x@example.com").id, "theirs");
+
+    expect(getAnalyticsCourses(null).map((c) => c.id)).toEqual(
+      expect.arrayContaining([base.course.id, theirs.id])
+    );
+    expect(getAnalyticsCourses(null)).toHaveLength(2);
+  });
+
+  it("reports completion for any instructor's course", () => {
+    const theirs = addCourse(addInstructor("x@example.com").id, "theirs");
+    enroll(addStudent("student@example.com").id, theirs.id);
+
+    expect(getCourseCompletion(null, theirs.id)).toEqual({
+      enrollees: 1,
+      averageProgress: 0,
+      finished: 0,
+    });
   });
 });
