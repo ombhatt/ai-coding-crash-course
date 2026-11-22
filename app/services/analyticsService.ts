@@ -6,6 +6,10 @@ import {
   coupons,
   courses,
   enrollments,
+  LessonProgressStatus,
+  lessonProgress,
+  lessons,
+  modules,
   purchases,
   users,
 } from "~/db/schema";
@@ -362,4 +366,109 @@ export function getCourseRatings(instructorId: number): CourseRating[] {
     ...course,
     ...summaries.get(course.courseId)!,
   }));
+}
+
+// ─── Course completion ───
+// Progress records carry no start time, so these are all-time figures. Two
+// numbers rather than one "completion rate": average progress says whether
+// people work through the course, the finished count says how many got to
+// the end.
+
+export type AnalyticsCourse = {
+  id: number;
+  title: string;
+  status: CourseStatus;
+};
+
+/**
+ * The courses the Course detail picker offers: every one the instructor owns,
+ * drafts and archived included — enrollments survive unpublishing, so hiding
+ * those courses would hide real students. Published come first, so defaulting
+ * to the first lands on a live course.
+ */
+export function getAnalyticsCourses(instructorId: number): AnalyticsCourse[] {
+  return db
+    .select({ id: courses.id, title: courses.title, status: courses.status })
+    .from(courses)
+    .where(eq(courses.instructorId, instructorId))
+    .orderBy(
+      sql`${courses.status} <> ${CourseStatus.Published}`,
+      sql`lower(${courses.title})`,
+      courses.id
+    )
+    .all();
+}
+
+export type CourseCompletion = {
+  /** Everyone enrolled in the course. */
+  enrollees: number;
+  /**
+   * Mean of each enrollee's completed lessons / total lessons, as a whole
+   * percentage. Lesson-count based, never duration-weighted. Enrollees who
+   * never started count as 0.
+   */
+  averageProgress: number;
+  /**
+   * Enrollees who completed every lesson, or whose enrollment is marked
+   * complete. Lessons are the main signal: enrollment completion is rarely
+   * marked, so on its own it would undercount.
+   */
+  finished: number;
+};
+
+/** Null when the course isn't the instructor's, so nothing leaks across. */
+export function getCourseCompletion(
+  instructorId: number,
+  courseId: number
+): CourseCompletion | null {
+  const owned = db
+    .select({ id: courses.id })
+    .from(courses)
+    .where(
+      and(eq(courses.id, courseId), eq(courses.instructorId, instructorId))
+    )
+    .get();
+  if (!owned) return null;
+
+  const progressLesson = alias(lessons, "progress_lesson");
+  const progressModule = alias(modules, "progress_module");
+  const completedLessons = sql<number>`(select count(distinct ${lessonProgress.lessonId})
+    from ${lessonProgress}
+    join ${lessons} ${progressLesson} on ${progressLesson.id} = ${lessonProgress.lessonId}
+    join ${modules} ${progressModule} on ${progressModule.id} = ${progressLesson.moduleId}
+    where ${progressModule.courseId} = ${enrollments.courseId}
+      and ${lessonProgress.userId} = ${enrollments.userId}
+      and ${lessonProgress.status} = ${LessonProgressStatus.Completed})`;
+
+  const totalLessons =
+    db
+      .select({ count: sql<number>`count(*)` })
+      .from(lessons)
+      .innerJoin(modules, eq(modules.id, lessons.moduleId))
+      .where(eq(modules.courseId, courseId))
+      .get()?.count ?? 0;
+
+  const row = db
+    .select({
+      enrollees: sql<number>`count(*)`,
+      completedLessons: sql<number>`coalesce(sum(${completedLessons}), 0)`,
+      finished: sql<number>`coalesce(sum(
+        ${enrollments.completedAt} is not null
+          or (${totalLessons} > 0 and ${completedLessons} = ${totalLessons})
+      ), 0)`,
+    })
+    .from(enrollments)
+    .where(eq(enrollments.courseId, courseId))
+    .get();
+
+  const enrollees = row?.enrollees ?? 0;
+  const possible = enrollees * totalLessons;
+  return {
+    enrollees,
+    averageProgress:
+      possible === 0
+        ? 0
+        : Math.round((100 * (row?.completedLessons ?? 0)) / possible),
+    finished: row?.finished ?? 0,
+  };
 }

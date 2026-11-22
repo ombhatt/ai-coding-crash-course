@@ -9,7 +9,9 @@ import {
 } from "~/lib/analytics";
 import {
   type RevenueSeries,
+  getAnalyticsCourses,
   getAudienceSummary,
+  getCourseCompletion,
   getCourseRatings,
   getRevenueSeries,
   getRevenueSummary,
@@ -31,7 +33,22 @@ import {
 } from "~/components/ui/chart";
 import { Bar, BarChart, CartesianGrid, XAxis, YAxis } from "recharts";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "~/components/ui/tabs";
-import { AlertTriangle, BarChart3, BookPlus, Users } from "lucide-react";
+import {
+  AlertTriangle,
+  BarChart3,
+  BookPlus,
+  GraduationCap,
+  Users,
+} from "lucide-react";
+import { Label } from "~/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "~/components/ui/select";
+import { CourseStatus } from "~/db/schema";
 import { cn, formatCents } from "~/lib/utils";
 
 // ─── Instructor Analytics ───
@@ -45,6 +62,7 @@ type AnalyticsTab = (typeof TABS)[number];
 const searchSchema = z.object({
   tab: z.enum(TABS).catch("overview"),
   range: z.enum(ANALYTICS_RANGES).catch("30d"),
+  course: z.coerce.number().int().optional().catch(undefined),
 });
 
 const RANGE_LABELS: Record<AnalyticsRange, string> = {
@@ -60,7 +78,7 @@ export function meta() {
 
 export async function loader({ request }: Route.LoaderArgs) {
   const { userId } = await requireInstructorOrAdmin(request);
-  const { tab, range } = searchSchema.parse(
+  const { tab, range, course } = searchSchema.parse(
     Object.fromEntries(new URL(request.url).searchParams)
   );
 
@@ -68,10 +86,18 @@ export async function loader({ request }: Route.LoaderArgs) {
     return { tab, range, hasPublishedCourses: false as const };
   }
 
+  // An id that isn't one of the instructor's own falls back to the default,
+  // so a hand-edited URL can't reach another instructor's course.
+  const courses = getAnalyticsCourses(userId);
+  const selectedCourse = courses.find((c) => c.id === course) ?? courses[0];
+
   return {
     tab,
     range,
     hasPublishedCourses: true as const,
+    courses,
+    selectedCourseId: selectedCourse.id,
+    completion: getCourseCompletion(userId, selectedCourse.id),
     revenue: getRevenueSummary(userId, range),
     revenueSeries: getRevenueSeries(userId, range),
     audience: getAudienceSummary(userId, range),
@@ -96,9 +122,11 @@ function PageHeader() {
 function RangeSelector({
   range,
   tab,
+  courseId,
 }: {
   range: AnalyticsRange;
   tab: AnalyticsTab;
+  courseId: number;
 }) {
   return (
     <nav
@@ -108,7 +136,7 @@ function RangeSelector({
       {ANALYTICS_RANGES.map((option) => (
         <Link
           key={option}
-          to={`?tab=${tab}&range=${option}`}
+          to={`?tab=${tab}&range=${option}&course=${courseId}`}
           preventScrollReset
           aria-current={option === range ? "page" : undefined}
           className={cn(
@@ -460,6 +488,88 @@ function RevenueChart({ series }: { series: RevenueSeries }) {
   );
 }
 
+function CoursePicker({
+  courses,
+  value,
+  onChange,
+}: {
+  courses: OverviewData["courses"];
+  value: string;
+  onChange: (courseId: string) => void;
+}) {
+  return (
+    <div className="flex items-center gap-3">
+      <Label htmlFor="analytics-course">Course</Label>
+      <Select value={value} onValueChange={onChange}>
+        <SelectTrigger id="analytics-course" className="w-72">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {courses.map((course) => (
+            <SelectItem key={course.id} value={String(course.id)}>
+              {course.title}
+              {course.status !== CourseStatus.Published &&
+                ` (${course.status})`}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
+function CompletionPanel({
+  completion,
+}: {
+  completion: OverviewData["completion"];
+}) {
+  if (!completion || completion.enrollees === 0) {
+    return (
+      <Card>
+        <CardContent className="py-10 text-center">
+          <GraduationCap className="mx-auto mb-3 size-10 text-muted-foreground" />
+          <p className="font-medium">No students yet</p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Progress and completions will show here once students enroll in this
+            course.
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  const { enrollees, averageProgress, finished } = completion;
+  return (
+    <div className="grid gap-4 sm:grid-cols-2">
+      <StatCard
+        label="Average progress"
+        value={`${averageProgress}%`}
+        hint={`Share of lessons completed, averaged over all ${enrollees} ${
+          enrollees === 1 ? "student" : "students"
+        }.`}
+        emphasis
+      >
+        <div className="mt-3 h-1.5 rounded-full bg-muted">
+          <div
+            className="h-1.5 rounded-full bg-primary"
+            style={{ width: `${averageProgress}%` }}
+          />
+        </div>
+      </StatCard>
+      <StatCard
+        label="Finished"
+        value={finished}
+        hint={
+          finished === 0
+            ? "Nobody has finished this course yet."
+            : `Students who reached the end of the course, out of ${enrollees} enrolled.`
+        }
+        emphasis
+      />
+    </div>
+  );
+}
+
 function NoPublishedCourses() {
   return (
     <Card>
@@ -501,8 +611,12 @@ export default function InstructorAnalytics({
     topBuyers,
     unansweredQuestions,
     ratings,
+    courses,
+    selectedCourseId,
+    completion,
   } = loaderData;
   const scope = RANGE_LABELS[range].toLowerCase();
+  const course = String(selectedCourseId);
 
   return (
     <div className="mx-auto max-w-5xl p-6 lg:p-8">
@@ -511,7 +625,10 @@ export default function InstructorAnalytics({
       <Tabs
         value={tab}
         onValueChange={(next) =>
-          setSearchParams({ tab: next, range }, { preventScrollReset: true })
+          setSearchParams(
+            { tab: next, range, course },
+            { preventScrollReset: true }
+          )
         }
         className="gap-6"
       >
@@ -520,7 +637,7 @@ export default function InstructorAnalytics({
             <TabsTrigger value="overview">Overview</TabsTrigger>
             <TabsTrigger value="course">Course detail</TabsTrigger>
           </TabsList>
-          <RangeSelector range={range} tab={tab} />
+          <RangeSelector range={range} tab={tab} courseId={selectedCourseId} />
         </div>
 
         <TabsContent value="overview">
@@ -606,15 +723,25 @@ export default function InstructorAnalytics({
         </TabsContent>
 
         <TabsContent value="course">
-          <Card>
-            <CardContent className="py-12 text-center">
-              <BarChart3 className="mx-auto mb-4 size-12 text-muted-foreground" />
-              <p className="font-medium">Course detail</p>
-              <p className="mt-1 text-sm text-muted-foreground">
-                Per-course progress and drop-off will appear here.
-              </p>
-            </CardContent>
-          </Card>
+          <CoursePicker
+            courses={courses}
+            value={course}
+            onChange={(next) =>
+              setSearchParams(
+                { tab, range, course: next },
+                { preventScrollReset: true }
+              )
+            }
+          />
+
+          <section aria-labelledby="completion-heading" className="mt-6">
+            <SectionHeading
+              id="completion-heading"
+              title="Completion"
+              scope="all time"
+            />
+            <CompletionPanel completion={completion} />
+          </section>
         </TabsContent>
       </Tabs>
     </div>
