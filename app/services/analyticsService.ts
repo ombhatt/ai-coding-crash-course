@@ -20,9 +20,12 @@ import {
   lessons,
   modules,
   purchases,
+  quizAttempts,
+  quizzes,
   users,
 } from "~/db/schema";
 import { PLATFORM_FEE_PERCENT } from "~/lib/fees";
+import { COUNTRIES, getDiscountForCountry } from "~/lib/ppp";
 import { type AnalyticsRange, TOP_BUYER_LIMIT } from "~/lib/analytics";
 import {
   type CourseRatingSummary,
@@ -95,6 +98,18 @@ function ownedBy(instructorId: number | null) {
   return instructorId === null
     ? undefined
     : eq(courses.instructorId, instructorId);
+}
+
+/**
+ * The course, if the instructor may see it — any course for null (admins
+ * viewing every instructor).
+ */
+function findOwnedCourse(instructorId: number | null, courseId: number) {
+  return db
+    .select({ pppEnabled: courses.pppEnabled })
+    .from(courses)
+    .where(and(eq(courses.id, courseId), ownedBy(instructorId)))
+    .get();
 }
 
 // ─── Revenue over time ───
@@ -438,12 +453,7 @@ export function getCourseCompletion(
   instructorId: number | null,
   courseId: number
 ): CourseCompletion | null {
-  const owned = db
-    .select({ id: courses.id })
-    .from(courses)
-    .where(and(eq(courses.id, courseId), ownedBy(instructorId)))
-    .get();
-  if (!owned) return null;
+  if (!findOwnedCourse(instructorId, courseId)) return null;
 
   const progressLesson = alias(lessons, "progress_lesson");
   const progressModule = alias(modules, "progress_module");
@@ -542,12 +552,7 @@ export function getCourseDropOff(
   instructorId: number | null,
   courseId: number
 ): CourseDropOff | null {
-  const owned = db
-    .select({ id: courses.id })
-    .from(courses)
-    .where(and(eq(courses.id, courseId), ownedBy(instructorId)))
-    .get();
-  if (!owned) return null;
+  if (!findOwnedCourse(instructorId, courseId)) return null;
 
   const courseLessons = db
     .select({
@@ -645,4 +650,155 @@ export function getCourseDropOff(
     neverStarted: enrollees - (reached[0] ?? 0),
     modules: [...byModule.values()],
   };
+}
+
+// ─── Quiz pass rates ───
+// Whether an assessment is too hard or too easy shows in how people do on
+// their first go: a retake comes after a second look at the lesson, and counting
+// attempts would let one student's five retries drown out everyone else. So
+// each quiz is rated per student — first-attempt pass rate for difficulty,
+// beside the share who have passed at all, which says whether it holds people
+// back. All time: attempts are few, and a quiz's difficulty doesn't drift.
+
+export type QuizPassRate = {
+  quizId: number;
+  title: string;
+  lessonTitle: string;
+  /** Distinct students who have attempted the quiz. */
+  students: number;
+  /** Whole percentage of those students who passed their first attempt. */
+  firstAttemptPassRate: number;
+  /** Whole percentage of those students who have passed, retakes included. */
+  passRate: number;
+};
+
+/**
+ * Every quiz in the course, in course order. Null when the course isn't the
+ * instructor's.
+ */
+export function getQuizPassRates(
+  instructorId: number | null,
+  courseId: number
+): QuizPassRate[] | null {
+  if (!findOwnedCourse(instructorId, courseId)) return null;
+
+  const earlier = alias(quizAttempts, "earlier_attempt");
+  const isFirstAttempt = sql`not exists (select 1 from ${quizAttempts} ${earlier}
+    where ${earlier.userId} = ${quizAttempts.userId}
+      and ${earlier.quizId} = ${quizAttempts.quizId}
+      and (${earlier.attemptedAt} < ${quizAttempts.attemptedAt}
+        or (${earlier.attemptedAt} = ${quizAttempts.attemptedAt}
+          and ${earlier.id} < ${quizAttempts.id})))`;
+
+  const rows = db
+    .select({
+      quizId: quizzes.id,
+      title: quizzes.title,
+      lessonTitle: lessons.title,
+      students: sql<number>`count(distinct ${quizAttempts.userId})`,
+      passedFirstTime: sql<number>`count(distinct case
+        when ${quizAttempts.passed} and ${isFirstAttempt}
+        then ${quizAttempts.userId} end)`,
+      passed: sql<number>`count(distinct case
+        when ${quizAttempts.passed} then ${quizAttempts.userId} end)`,
+    })
+    .from(quizzes)
+    .innerJoin(lessons, eq(lessons.id, quizzes.lessonId))
+    .innerJoin(modules, eq(modules.id, lessons.moduleId))
+    .leftJoin(quizAttempts, eq(quizAttempts.quizId, quizzes.id))
+    .where(eq(modules.courseId, courseId))
+    .groupBy(quizzes.id)
+    .orderBy(modules.position, lessons.position, quizzes.id)
+    .all();
+
+  return rows.map(({ passedFirstTime, passed, ...quiz }) => ({
+    ...quiz,
+    firstAttemptPassRate: percentOf(passedFirstTime, quiz.students),
+    passRate: percentOf(passed, quiz.students),
+  }));
+}
+
+// ─── Revenue by country ───
+// Purchases record the buyer's country, not the discount they got, so each
+// country is classified by the PPP discount its buyers are charged — none at
+// all on a course with PPP pricing switched off. Every
+// purchase lands in exactly one country bucket — a missing country is its own
+// "Unknown" bucket — so the buckets, and the discounted / full-price split,
+// always add up to the course's gross for the range.
+
+export type CountryRevenue = {
+  /** ISO code; null for purchases that recorded no country. */
+  country: string | null;
+  name: string;
+  purchases: number;
+  /** Cents. */
+  gross: number;
+  /** The PPP discount buyers from here pay at, as a whole percentage; 0 for full price. */
+  pppDiscountPercent: number;
+};
+
+/** All in integer cents. `pppDiscountedGross + fullPriceGross === gross`. */
+export type CountryRevenueSummary = {
+  gross: number;
+  pppDiscountedGross: number;
+  fullPriceGross: number;
+  /** Most revenue first. */
+  countries: CountryRevenue[];
+};
+
+/** Null when the course isn't the instructor's. */
+export function getRevenueByCountry(
+  instructorId: number | null,
+  courseId: number,
+  range: AnalyticsRange
+): CountryRevenueSummary | null {
+  const course = findOwnedCourse(instructorId, courseId);
+  if (!course) return null;
+
+  // The same purchases getRevenueSummary counts, narrowed to this course.
+  const gross = sql<number>`sum(${purchases.amountPaid})`;
+  const rows = db
+    .select({
+      country: purchases.country,
+      purchases: sql<number>`count(*)`,
+      gross,
+    })
+    .from(purchases)
+    .innerJoin(courses, eq(courses.id, purchases.courseId))
+    .where(
+      and(
+        eq(purchases.courseId, courseId),
+        instructorPurchasesInRange(instructorId, rangeCutoff(range))
+      )
+    )
+    .groupBy(purchases.country)
+    .orderBy(desc(gross), sql`${purchases.country} is null`, purchases.country)
+    .all();
+
+  const countries = rows.map((row) => ({
+    ...row,
+    name: countryName(row.country),
+    pppDiscountPercent: course.pppEnabled
+      ? Math.round(100 * getDiscountForCountry(row.country))
+      : 0,
+  }));
+  const total = (list: CountryRevenue[]) =>
+    list.reduce((sum, c) => sum + c.gross, 0);
+  const discounted = countries.filter((c) => c.pppDiscountPercent > 0);
+  return {
+    gross: total(countries),
+    pppDiscountedGross: total(discounted),
+    fullPriceGross: total(countries) - total(discounted),
+    countries,
+  };
+}
+
+function countryName(code: string | null): string {
+  if (code === null) return "Unknown";
+  return COUNTRIES.find((c) => c.code === code)?.name ?? code;
+}
+
+/** `part` as a whole percentage of `whole`; 0, not NaN, when `whole` is 0. */
+function percentOf(part: number, whole: number): number {
+  return whole === 0 ? 0 : Math.round((100 * part) / whole);
 }

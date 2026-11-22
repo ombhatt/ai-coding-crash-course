@@ -14,6 +14,8 @@ import {
   getCourseCompletion,
   getCourseDropOff,
   getCourseRatings,
+  getQuizPassRates,
+  getRevenueByCountry,
   getRevenueSeries,
   getRevenueSummary,
   getTopBuyers,
@@ -47,6 +49,8 @@ import {
   AlertTriangle,
   BarChart3,
   BookPlus,
+  ClipboardCheck,
+  Globe,
   GraduationCap,
   Users,
 } from "lucide-react";
@@ -139,6 +143,8 @@ export async function loader({ request }: Route.LoaderArgs) {
     selectedCourseId: selectedCourse.id,
     completion: getCourseCompletion(instructorId, selectedCourse.id),
     dropOff: getCourseDropOff(instructorId, selectedCourse.id),
+    quizPassRates: getQuizPassRates(instructorId, selectedCourse.id),
+    countryRevenue: getRevenueByCountry(instructorId, selectedCourse.id, range),
   };
 }
 
@@ -830,6 +836,8 @@ export default function InstructorAnalytics({
     selectedCourseId,
     completion,
     dropOff,
+    quizPassRates,
+    countryRevenue,
   } = loaderData;
   const scope = RANGE_LABELS[range].toLowerCase();
   const course = String(selectedCourseId);
@@ -973,8 +981,182 @@ export default function InstructorAnalytics({
             />
             <DropOffPanel dropOff={dropOff} />
           </section>
+
+          <section aria-labelledby="quiz-pass-rates-heading" className="mt-8">
+            <SectionHeading
+              id="quiz-pass-rates-heading"
+              title="Quiz pass rates"
+              scope="all time"
+            />
+            <QuizPassRatesPanel quizzes={quizPassRates} />
+          </section>
+
+          <section aria-labelledby="country-revenue-heading" className="mt-8">
+            <SectionHeading
+              id="country-revenue-heading"
+              title="Revenue by country"
+              scope={scope}
+            />
+            <CountryRevenuePanel revenue={countryRevenue} />
+          </section>
         </TabsContent>
       </Tabs>
+    </div>
+  );
+}
+
+function QuizPassRatesPanel({
+  quizzes,
+}: {
+  quizzes: OverviewData["quizPassRates"];
+}) {
+  if (!quizzes || quizzes.length === 0) {
+    return (
+      <Card>
+        <CardContent className="py-10 text-center">
+          <ClipboardCheck className="mx-auto mb-3 size-10 text-muted-foreground" />
+          <p className="font-medium">No quizzes in this course</p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Add a quiz to a lesson to see how students do on it.
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <div className="overflow-x-auto rounded-md border">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="border-b bg-muted/50">
+            <th className="px-4 py-3 text-left font-medium">Quiz</th>
+            <th className="px-4 py-3 text-right font-medium">Students</th>
+            <th className="px-4 py-3 text-right font-medium">
+              Passed first try
+            </th>
+            <th className="px-4 py-3 text-right font-medium">Passed by now</th>
+          </tr>
+        </thead>
+        <tbody>
+          {quizzes.map((quiz) => (
+            <tr key={quiz.quizId} className="border-b last:border-0">
+              <td className="px-4 py-3">
+                <div className="font-medium">{quiz.title}</div>
+                <div className="text-xs text-muted-foreground">
+                  {quiz.lessonTitle}
+                </div>
+              </td>
+              <td className="px-4 py-3 text-right tabular-nums">
+                {quiz.students}
+              </td>
+              {quiz.students === 0 ? (
+                <td
+                  colSpan={2}
+                  className="px-4 py-3 text-right text-xs text-muted-foreground"
+                >
+                  No attempts yet
+                </td>
+              ) : (
+                <>
+                  <td className="px-4 py-3 text-right font-medium tabular-nums">
+                    {quiz.firstAttemptPassRate}%
+                  </td>
+                  <td className="px-4 py-3 text-right tabular-nums">
+                    {quiz.passRate}%
+                  </td>
+                </>
+              )}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function CountryRevenuePanel({
+  revenue,
+}: {
+  revenue: OverviewData["countryRevenue"];
+}) {
+  if (!revenue || revenue.countries.length === 0) {
+    return (
+      <Card>
+        <CardContent className="py-10 text-center">
+          <Globe className="mx-auto mb-3 size-10 text-muted-foreground" />
+          <p className="font-medium">No sales in this period</p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Where this course's buyers are will show here once it sells.
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="grid gap-4 sm:grid-cols-3">
+        <StatCard
+          label="Gross revenue"
+          value={formatCents(revenue.gross)}
+          hint="Everything buyers paid for this course."
+        />
+        <StatCard
+          label="PPP-discounted"
+          value={formatCents(revenue.pppDiscountedGross)}
+          hint={
+            revenue.pppDiscountedGross === 0
+              ? "No sales at a purchasing-power discount."
+              : "From buyers in regions priced at a purchasing-power discount."
+          }
+          emphasis
+        />
+        <StatCard
+          label="Full price"
+          value={formatCents(revenue.fullPriceGross)}
+          hint="From buyers who paid the list price."
+          emphasis
+        />
+      </div>
+      <div className="overflow-x-auto rounded-md border">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="border-b bg-muted/50">
+              <th className="px-4 py-3 text-left font-medium">Country</th>
+              <th className="px-4 py-3 text-left font-medium">Pricing</th>
+              <th className="px-4 py-3 text-right font-medium">Purchases</th>
+              <th className="px-4 py-3 text-right font-medium">Revenue</th>
+            </tr>
+          </thead>
+          <tbody>
+            {revenue.countries.map((row) => (
+              <tr
+                key={row.country ?? "unknown"}
+                className="border-b last:border-0"
+              >
+                <td className="px-4 py-3 font-medium">{row.name}</td>
+                <td className="px-4 py-3">
+                  {row.pppDiscountPercent > 0 ? (
+                    <span className="inline-flex items-center rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
+                      PPP · {row.pppDiscountPercent}% off
+                    </span>
+                  ) : (
+                    <span className="text-xs text-muted-foreground">
+                      Full price
+                    </span>
+                  )}
+                </td>
+                <td className="px-4 py-3 text-right tabular-nums">
+                  {row.purchases}
+                </td>
+                <td className="px-4 py-3 text-right font-medium tabular-nums">
+                  {formatCents(row.gross)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
