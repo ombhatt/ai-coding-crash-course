@@ -1,4 +1,4 @@
-import { Award, Trophy, type LucideIcon } from "lucide-react";
+import { Award, Layers, Trophy, type LucideIcon } from "lucide-react";
 import { BadgeFamily, type EarnedBadge } from "~/lib/badges";
 import { cn } from "~/lib/utils";
 
@@ -6,6 +6,10 @@ const FAMILY_STYLE: Record<BadgeFamily, { icon: LucideIcon; className: string }>
   [BadgeFamily.Course]: {
     icon: Trophy,
     className: "bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-400",
+  },
+  [BadgeFamily.Module]: {
+    icon: Layers,
+    className: "bg-sky-100 text-sky-700 dark:bg-sky-950 dark:text-sky-400",
   },
 };
 
@@ -16,7 +20,7 @@ export function BadgeShelf({ badges }: { badges: EarnedBadge[] }) {
       {badges.length === 0 ? (
         <div className="flex items-center gap-3 rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
           <Award className="size-5" />
-          Finish a course to earn your first badge.
+          Finish a module to earn your first badge.
         </div>
       ) : (
         <ul className="flex flex-wrap gap-3">

@@ -1,4 +1,4 @@
-import { and, asc, count, eq } from "drizzle-orm";
+import { and, asc, count, eq, sql } from "drizzle-orm";
 import { db } from "~/db";
 import {
   courses,
@@ -13,6 +13,7 @@ import {
 import {
   COURSE_FINISHER,
   COURSE_MILESTONES,
+  MODULE_MILESTONES,
   getBadgeDefinition,
   type BadgeDefinition,
   type EarnedBadge,
@@ -107,31 +108,70 @@ function toEarned(
  * Awards any badges a lesson completion has unlocked and returns only the
  * badges that are new in this call. Call after `markLessonComplete`.
  */
+// Modules with at least one lesson where the user has completed every lesson.
+// Joining lessons (not left-joining) is what keeps empty modules out.
+function countFinishedModules(userId: number) {
+  const row = db.get<{ n: number }>(sql`
+    select count(*) as n from (
+      select ${modules.id}
+      from ${modules}
+      join ${lessons} on ${lessons.moduleId} = ${modules.id}
+      left join ${lessonProgress}
+        on ${lessonProgress.lessonId} = ${lessons.id}
+        and ${lessonProgress.userId} = ${userId}
+        and ${lessonProgress.status} = ${LessonProgressStatus.Completed}
+      group by ${modules.id}
+      having count(distinct ${lessons.id}) = count(distinct ${lessonProgress.lessonId})
+    )
+  `);
+  return row.n;
+}
+
+// Awards every milestone whose threshold `reached` meets, skipping ones
+// already held. Returns only the newly awarded milestones.
+function awardMilestones(
+  userId: number,
+  milestones: BadgeDefinition[],
+  reached: number
+): EarnedBadge[] {
+  return milestones.flatMap((milestone) => {
+    if (reached < milestone.threshold!) return [];
+    const row = award(userId, milestone, null);
+    return row ? [toEarned(milestone, row, null)] : [];
+  });
+}
+
+/**
+ * Awards any badges a lesson completion has unlocked and returns only the
+ * badges that are new in this call, module badges before course badges.
+ * Call after `markLessonComplete`.
+ */
 export function awardBadgesForLessonCompletion(
   userId: number,
   lessonId: number
 ): EarnedBadge[] {
   if (!isStudent(userId)) return [];
 
+  const newBadges = awardMilestones(
+    userId,
+    MODULE_MILESTONES,
+    countFinishedModules(userId)
+  );
+
   const course = getCourseForLesson(lessonId);
-  if (!course || !isCourseComplete(userId, course.id)) return [];
+  if (!course || !isCourseComplete(userId, course.id)) return newBadges;
 
   const enrollment = findEnrollment(userId, course.id);
   if (enrollment && !enrollment.completedAt) {
     markEnrollmentComplete(userId, course.id);
   }
 
-  const newBadges: EarnedBadge[] = [];
-
   const finisher = award(userId, COURSE_FINISHER, course.id);
   if (finisher) newBadges.push(toEarned(COURSE_FINISHER, finisher, course.title));
 
-  const finished = countFinishedCourses(userId);
-  for (const milestone of COURSE_MILESTONES) {
-    if (finished < milestone.threshold!) continue;
-    const row = award(userId, milestone, null);
-    if (row) newBadges.push(toEarned(milestone, row, null));
-  }
+  newBadges.push(
+    ...awardMilestones(userId, COURSE_MILESTONES, countFinishedCourses(userId))
+  );
 
   return newBadges;
 }

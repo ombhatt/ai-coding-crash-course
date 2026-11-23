@@ -35,6 +35,22 @@ function createLessons(courseId: number, lessonCount: number) {
   );
 }
 
+function createCourse(slug: string) {
+  return testDb
+    .insert(schema.courses)
+    .values({
+      title: slug,
+      slug,
+      description: slug,
+      salesCopy: slug,
+      instructorId: base.instructor.id,
+      categoryId: base.category.id,
+      status: schema.CourseStatus.Published,
+    })
+    .returning()
+    .get();
+}
+
 function completeLesson(userId: number, lessonId: number) {
   markLessonComplete(userId, lessonId);
   return awardBadgesForLessonCompletion(userId, lessonId);
@@ -57,6 +73,7 @@ describe("badgeService", () => {
       expect(
         newBadges.map((b) => ({ key: b.key, courseTitle: b.courseTitle }))
       ).toEqual([
+        { key: "modules-1", courseTitle: null },
         { key: "course-finisher", courseTitle: "Test Course" },
         { key: "courses-1", courseTitle: null },
       ]);
@@ -131,10 +148,73 @@ describe("badgeService", () => {
       });
 
       expect(results).toEqual([
-        ["course-finisher", "courses-1"],
+        ["modules-1", "course-finisher", "courses-1"],
         ["course-finisher"],
         ["course-finisher", "courses-3"],
       ]);
+    });
+  });
+
+  describe("module milestones", () => {
+    it("awards the first-module milestone when a student finishes a module but not the course", () => {
+      const firstModule = createLessons(base.course.id, 2);
+      createLessons(base.course.id, 1);
+      enrollUser(base.user.id, base.course.id, false, false);
+
+      completeLesson(base.user.id, firstModule[0].id);
+      const newBadges = completeLesson(base.user.id, firstModule[1].id);
+
+      expect(newBadges.map((b) => b.key)).toEqual(["modules-1"]);
+    });
+
+    it("counts modules finished across different courses toward the five-module milestone", () => {
+      // Each course gets a second, unfinished module so no course completes.
+      const finishedModules = ["a", "b", "c", "d", "e"].map((slug) => {
+        const course = createCourse(slug);
+        enrollUser(base.user.id, course.id, false, false);
+        createLessons(course.id, 1);
+        return createLessons(course.id, 1);
+      });
+
+      const results = finishedModules.map(([lesson]) =>
+        completeLesson(base.user.id, lesson.id).map((b) => b.key)
+      );
+
+      expect(results).toEqual([["modules-1"], [], [], [], ["modules-5"]]);
+    });
+
+    it("awards module and course badges together, module first, when one lesson finishes both", () => {
+      const [lesson] = createLessons(base.course.id, 1);
+      enrollUser(base.user.id, base.course.id, false, false);
+
+      expect(
+        completeLesson(base.user.id, lesson.id).map((b) => b.family)
+      ).toEqual(["module", "course", "course"]);
+    });
+
+    it("does not count empty modules toward a milestone", () => {
+      const lessons = createLessons(base.course.id, 1);
+      createLessons(base.course.id, 1); // keeps the course unfinished
+      createLessons(base.course.id, 0);
+      createLessons(base.course.id, 0);
+      createLessons(base.course.id, 0);
+      createLessons(base.course.id, 0);
+      enrollUser(base.user.id, base.course.id, false, false);
+
+      expect(
+        completeLesson(base.user.id, lessons[0].id).map((b) => b.key)
+      ).toEqual(["modules-1"]);
+    });
+
+    it("awards nothing new when a finished module's lesson is reset and completed again", () => {
+      const lessons = createLessons(base.course.id, 1);
+      createLessons(base.course.id, 1); // keeps the course unfinished
+      enrollUser(base.user.id, base.course.id, false, false);
+      completeLesson(base.user.id, lessons[0].id);
+
+      resetLessonProgress(base.user.id, lessons[0].id);
+
+      expect(completeLesson(base.user.id, lessons[0].id)).toEqual([]);
     });
   });
 
@@ -150,6 +230,7 @@ describe("badgeService", () => {
           courseTitle: b.courseTitle,
         }))
       ).toEqual([
+        { name: "First Module", courseTitle: null },
         { name: "Course Finisher", courseTitle: "Test Course" },
         { name: "First Finish", courseTitle: null },
       ]);

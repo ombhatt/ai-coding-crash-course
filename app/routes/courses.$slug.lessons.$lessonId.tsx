@@ -67,6 +67,7 @@ import { YouTubePlayer } from "~/components/youtube-player";
 import { data, isRouteErrorResponse } from "react-router";
 import { z } from "zod";
 import { COUNTRIES } from "~/lib/ppp";
+import type { EarnedBadge } from "~/lib/badges";
 import { parseFormData, parseParams } from "~/lib/validation";
 
 const lessonParamsSchema = z.object({
@@ -469,6 +470,8 @@ function useAutoplay() {
   return [enabled, toggle] as const;
 }
 
+const MAX_BADGE_TOASTS = 3;
+
 export default function LessonViewer({ loaderData }: Route.ComponentProps) {
   const {
     course,
@@ -508,9 +511,17 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
   const isCompleted =
     lessonStatus === LessonProgressStatus.Completed || justCompleted;
 
-  const newBadges = fetcher.data?.newBadges;
+  const newBadges: EarnedBadge[] | undefined = fetcher.data?.newBadges;
   useEffect(() => {
-    for (const badge of newBadges ?? []) {
+    if (!newBadges?.length) return;
+    // Sonner shows at most 3 toasts at once; a bigger batch would hide some.
+    if (newBadges.length > MAX_BADGE_TOASTS) {
+      toast.success(`🏅 ${newBadges.length} badges earned`, {
+        description: newBadges.map((b) => b.name).join(", "),
+      });
+      return;
+    }
+    for (const badge of newBadges) {
       toast.success(`🏅 Badge earned: ${badge.name}`, {
         description: badge.courseTitle
           ? `Finished ${badge.courseTitle}`
