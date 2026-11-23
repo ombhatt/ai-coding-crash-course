@@ -14,11 +14,14 @@ import {
   COURSE_FINISHER,
   COURSE_MILESTONES,
   MODULE_MILESTONES,
+  STREAK_MILESTONES,
   getBadgeDefinition,
   type BadgeDefinition,
   type EarnedBadge,
 } from "~/lib/badges";
+import { weeklyStreak } from "~/lib/streak";
 import { findEnrollment, markEnrollmentComplete } from "./enrollmentService";
+import { getLessonProgress } from "./progressService";
 
 function isStudent(userId: number) {
   const user = db
@@ -104,10 +107,6 @@ function toEarned(
   };
 }
 
-/**
- * Awards any badges a lesson completion has unlocked and returns only the
- * badges that are new in this call. Call after `markLessonComplete`.
- */
 // Modules with at least one lesson where the user has completed every lesson.
 // Joining lessons (not left-joining) is what keeps empty modules out.
 function countFinishedModules(userId: number) {
@@ -141,9 +140,50 @@ function awardMilestones(
   });
 }
 
+// Badges for finishing the lesson's course; none if the course is unfinished.
+// Also marks the enrollment complete the first time the course is finished.
+function awardCourseBadges(userId: number, lessonId: number): EarnedBadge[] {
+  const course = getCourseForLesson(lessonId);
+  if (!course || !isCourseComplete(userId, course.id)) return [];
+
+  const enrollment = findEnrollment(userId, course.id);
+  if (enrollment && !enrollment.completedAt) {
+    markEnrollmentComplete(userId, course.id);
+  }
+
+  const newBadges: EarnedBadge[] = [];
+  const finisher = award(userId, COURSE_FINISHER, course.id);
+  if (finisher) newBadges.push(toEarned(COURSE_FINISHER, finisher, course.title));
+
+  newBadges.push(
+    ...awardMilestones(userId, COURSE_MILESTONES, countFinishedCourses(userId))
+  );
+  return newBadges;
+}
+
+// The weekly streak ending at the week this lesson was completed in.
+function currentStreak(userId: number, lessonId: number) {
+  const completedAt = getLessonProgress(userId, lessonId)?.completedAt;
+  if (!completedAt) return 0;
+
+  const history = db
+    .select({ completedAt: lessonProgress.completedAt })
+    .from(lessonProgress)
+    .where(
+      and(
+        eq(lessonProgress.userId, userId),
+        eq(lessonProgress.status, LessonProgressStatus.Completed)
+      )
+    )
+    .all()
+    .flatMap((row) => (row.completedAt ? [row.completedAt] : []));
+
+  return weeklyStreak(history, completedAt);
+}
+
 /**
  * Awards any badges a lesson completion has unlocked and returns only the
- * badges that are new in this call, module badges before course badges.
+ * badges that are new in this call: module, then course, then streak badges.
  * Call after `markLessonComplete`.
  */
 export function awardBadgesForLessonCompletion(
@@ -152,28 +192,15 @@ export function awardBadgesForLessonCompletion(
 ): EarnedBadge[] {
   if (!isStudent(userId)) return [];
 
-  const newBadges = awardMilestones(
-    userId,
-    MODULE_MILESTONES,
-    countFinishedModules(userId)
-  );
-
-  const course = getCourseForLesson(lessonId);
-  if (!course || !isCourseComplete(userId, course.id)) return newBadges;
-
-  const enrollment = findEnrollment(userId, course.id);
-  if (enrollment && !enrollment.completedAt) {
-    markEnrollmentComplete(userId, course.id);
-  }
-
-  const finisher = award(userId, COURSE_FINISHER, course.id);
-  if (finisher) newBadges.push(toEarned(COURSE_FINISHER, finisher, course.title));
-
-  newBadges.push(
-    ...awardMilestones(userId, COURSE_MILESTONES, countFinishedCourses(userId))
-  );
-
-  return newBadges;
+  return [
+    ...awardMilestones(userId, MODULE_MILESTONES, countFinishedModules(userId)),
+    ...awardCourseBadges(userId, lessonId),
+    ...awardMilestones(
+      userId,
+      STREAK_MILESTONES,
+      currentStreak(userId, lessonId)
+    ),
+  ];
 }
 
 /** A user's earned badges, oldest first. */

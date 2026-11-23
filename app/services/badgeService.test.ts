@@ -56,6 +56,32 @@ function completeLesson(userId: number, lessonId: number) {
   return awardBadgesForLessonCompletion(userId, lessonId);
 }
 
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Records a completion `weeksAgo` weeks before now, as history for streaks.
+function completedWeeksAgo(userId: number, lessonId: number, weeksAgo: number) {
+  testDb
+    .insert(schema.lessonProgress)
+    .values({
+      userId,
+      lessonId,
+      status: schema.LessonProgressStatus.Completed,
+      completedAt: new Date(Date.now() - weeksAgo * WEEK_MS).toISOString(),
+    })
+    .run();
+}
+
+// Completes a lesson `weeksAgo` weeks before now and awards badges for it,
+// as if the student had clicked "Mark as Complete" back then.
+function completeLessonWeeksAgo(
+  userId: number,
+  lessonId: number,
+  weeksAgo: number
+) {
+  completedWeeksAgo(userId, lessonId, weeksAgo);
+  return awardBadgesForLessonCompletion(userId, lessonId);
+}
+
 describe("badgeService", () => {
   beforeEach(() => {
     testDb = createTestDb();
@@ -215,6 +241,41 @@ describe("badgeService", () => {
       resetLessonProgress(base.user.id, lessons[0].id);
 
       expect(completeLesson(base.user.id, lessons[0].id)).toEqual([]);
+    });
+  });
+
+  describe("weekly streaks", () => {
+    // One module with spare lessons, so no module or course badge interferes.
+    let lessons: ReturnType<typeof createLessons>;
+    beforeEach(() => {
+      lessons = createLessons(base.course.id, 5);
+      enrollUser(base.user.id, base.course.id, false, false);
+    });
+
+    it("awards the two-week streak for a completion last week and one now", () => {
+      completedWeeksAgo(base.user.id, lessons[0].id, 1);
+
+      expect(
+        completeLesson(base.user.id, lessons[1].id).map((b) => b.key)
+      ).toEqual(["streak-2"]);
+    });
+
+    it("awards nothing new for another completion in the same week", () => {
+      completedWeeksAgo(base.user.id, lessons[0].id, 1);
+      completeLesson(base.user.id, lessons[1].id);
+
+      expect(completeLesson(base.user.id, lessons[2].id)).toEqual([]);
+    });
+
+    it("keeps an earned streak badge after the streak breaks", () => {
+      completedWeeksAgo(base.user.id, lessons[0].id, 4);
+      completeLessonWeeksAgo(base.user.id, lessons[1].id, 3);
+      // two weeks missed
+
+      expect(completeLesson(base.user.id, lessons[2].id)).toEqual([]);
+      expect(getBadgesForUser(base.user.id).map((b) => b.key)).toEqual([
+        "streak-2",
+      ]);
     });
   });
 

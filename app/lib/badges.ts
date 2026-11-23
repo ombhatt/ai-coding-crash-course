@@ -4,6 +4,7 @@
 export enum BadgeFamily {
   Course = "course",
   Module = "module",
+  Streak = "streak",
 }
 
 export type BadgeDefinition = {
@@ -71,10 +72,30 @@ export const MODULE_MILESTONES: BadgeDefinition[] = [
   moduleMilestone(50, "Half Century"),
 ];
 
+const streakMilestone = (
+  threshold: number,
+  name: string
+): BadgeDefinition => ({
+  key: `streak-${threshold}`,
+  family: BadgeFamily.Streak,
+  name,
+  description: `Completed a lesson ${threshold} weeks in a row`,
+  threshold,
+});
+
+export const STREAK_MILESTONES: BadgeDefinition[] = [
+  streakMilestone(2, "On a Roll"),
+  streakMilestone(4, "Habit Formed"),
+  streakMilestone(8, "Steady Learner"),
+  streakMilestone(12, "Quarter Strong"),
+  streakMilestone(26, "Half-Year Habit"),
+];
+
 export const BADGE_DEFINITIONS: BadgeDefinition[] = [
   COURSE_FINISHER,
   ...COURSE_MILESTONES,
   ...MODULE_MILESTONES,
+  ...STREAK_MILESTONES,
 ];
 
 export function getBadgeDefinition(key: string): BadgeDefinition | undefined {
