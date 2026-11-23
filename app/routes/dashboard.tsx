@@ -2,7 +2,7 @@ import { Link } from "react-router";
 import type { Route } from "./+types/dashboard";
 import { getUserEnrolledCourses } from "~/services/enrollmentService";
 import { calculateProgress, getCompletedLessonCount, getTotalLessonCount, getNextIncompleteLesson } from "~/services/progressService";
-import { getBadgesForUser } from "~/services/badgeService";
+import { getBadgeProgress, getBadgesForUser } from "~/services/badgeService";
 import { getCurrentUserId } from "~/lib/session";
 import { BadgeShelf } from "~/components/badge-shelf";
 import { Card, CardContent, CardFooter, CardHeader } from "~/components/ui/card";
@@ -61,8 +61,9 @@ export async function loader({ request }: Route.LoaderArgs) {
   const inProgressCourses = coursesWithProgress.filter((c) => !c.isCompleted);
 
   const badges = getBadgesForUser(currentUserId);
+  const badgeProgress = getBadgeProgress(currentUserId, new Date());
 
-  return { inProgressCourses, completedCourses, badges };
+  return { inProgressCourses, completedCourses, badges, badgeProgress };
 }
 
 function DashboardCardSkeleton() {
@@ -105,7 +106,8 @@ export function HydrateFallback() {
 }
 
 export default function Dashboard({ loaderData }: Route.ComponentProps) {
-  const { inProgressCourses, completedCourses, badges } = loaderData;
+  const { inProgressCourses, completedCourses, badges, badgeProgress } =
+    loaderData;
   const totalCourses = inProgressCourses.length + completedCourses.length;
 
   return (
@@ -126,7 +128,7 @@ export default function Dashboard({ loaderData }: Route.ComponentProps) {
         </p>
       </div>
 
-      <BadgeShelf badges={badges} />
+      <BadgeShelf badges={badges} progress={badgeProgress} />
 
       {totalCourses === 0 ? (
         <div className="flex flex-col items-center justify-center py-16 text-center">

@@ -14,6 +14,8 @@ vi.mock("~/db", () => ({
 // Import after mock so the modules pick up our test db
 import {
   awardBadgesForLessonCompletion,
+  backfillBadges,
+  getBadgeProgress,
   getBadgesForUser,
 } from "./badgeService";
 import { markLessonComplete, resetLessonProgress } from "./progressService";
@@ -67,6 +69,20 @@ function completedWeeksAgo(userId: number, lessonId: number, weeksAgo: number) {
       lessonId,
       status: schema.LessonProgressStatus.Completed,
       completedAt: new Date(Date.now() - weeksAgo * WEEK_MS).toISOString(),
+    })
+    .run();
+}
+
+// Records a completion at a fixed time, without awarding anything — as if it
+// happened before badges existed.
+function completedAt(userId: number, lessonId: number, at: string) {
+  testDb
+    .insert(schema.lessonProgress)
+    .values({
+      userId,
+      lessonId,
+      status: schema.LessonProgressStatus.Completed,
+      completedAt: at,
     })
     .run();
 }
@@ -299,6 +315,156 @@ describe("badgeService", () => {
 
     it("returns an empty list for a student with no badges", () => {
       expect(getBadgesForUser(base.user.id)).toEqual([]);
+    });
+  });
+
+  describe("getBadgeProgress", () => {
+    const progressOf = (userId: number) =>
+      getBadgeProgress(userId, new Date()).map((p) => ({
+        name: p.name,
+        current: p.current,
+        target: p.target,
+      }));
+
+    it.each([schema.UserRole.Instructor, schema.UserRole.Admin])(
+      "shows a %s no progress, since staff cannot earn badges",
+      (role) => {
+        const staff = testDb
+          .insert(schema.users)
+          .values({ name: "Staff", email: `${role}@staff.test`, role })
+          .returning()
+          .get();
+
+        expect(progressOf(staff.id)).toEqual([]);
+      }
+    );
+
+    it("shows a new student the first level of every family at zero", () => {
+      expect(progressOf(base.user.id)).toEqual([
+        { name: "First Finish", current: 0, target: 1 },
+        { name: "First Module", current: 0, target: 1 },
+        { name: "On a Roll", current: 0, target: 2 },
+      ]);
+    });
+
+    it("counts finished modules toward the next module level once the first is earned", () => {
+      createLessons(base.course.id, 1); // keeps the course unfinished
+      enrollUser(base.user.id, base.course.id, false, false);
+      for (let i = 0; i < 3; i++) {
+        const [lesson] = createLessons(base.course.id, 1);
+        completeLesson(base.user.id, lesson.id);
+      }
+
+      expect(
+        progressOf(base.user.id).find((p) => p.name.startsWith("Module"))
+      ).toEqual({ name: "Module Mover", current: 3, target: 5 });
+    });
+
+    it("leaves out a family once every level in it is earned", () => {
+      for (const slug of ["c1", "c2", "c3", "c4", "c5"]) {
+        const course = createCourse(slug);
+        const [lesson] = createLessons(course.id, 1);
+        enrollUser(base.user.id, course.id, false, false);
+        completeLesson(base.user.id, lesson.id);
+      }
+
+      // Five single-module courses also finish five modules.
+      expect(progressOf(base.user.id).map((p) => p.name)).toEqual([
+        "Ten Down",
+        "On a Roll",
+      ]);
+    });
+
+    it("counts a streak that ended last week as still going", () => {
+      const lessons = createLessons(base.course.id, 5);
+      enrollUser(base.user.id, base.course.id, false, false);
+      completeLessonWeeksAgo(base.user.id, lessons[0].id, 2);
+      completeLessonWeeksAgo(base.user.id, lessons[1].id, 1);
+
+      expect(
+        progressOf(base.user.id).find((p) => p.name === "Habit Formed")
+      ).toEqual({ name: "Habit Formed", current: 2, target: 4 });
+    });
+
+    it("shows a streak as zero once a whole week has been missed", () => {
+      const lessons = createLessons(base.course.id, 5);
+      enrollUser(base.user.id, base.course.id, false, false);
+      completeLessonWeeksAgo(base.user.id, lessons[0].id, 2);
+
+      expect(
+        progressOf(base.user.id).find((p) => p.name === "On a Roll")
+      ).toEqual({ name: "On a Roll", current: 0, target: 2 });
+    });
+  });
+
+  describe("backfillBadges", () => {
+    // Monday of one week, then Tuesday of the next.
+    const MODULE_DONE = "2026-10-05T09:00:00.000Z";
+    const COURSE_DONE = "2026-10-13T09:00:00.000Z";
+
+    it("awards badges from past completions, dated to the completion that earned each", () => {
+      const [first] = createLessons(base.course.id, 1);
+      const [second] = createLessons(base.course.id, 1);
+      enrollUser(base.user.id, base.course.id, false, false);
+      completedAt(base.user.id, first.id, MODULE_DONE);
+      completedAt(base.user.id, second.id, COURSE_DONE);
+
+      backfillBadges();
+
+      expect(
+        getBadgesForUser(base.user.id).map((b) => [b.key, b.earnedAt])
+      ).toEqual([
+        ["modules-1", MODULE_DONE],
+        ["course-finisher", COURSE_DONE],
+        ["courses-1", COURSE_DONE],
+        ["streak-2", COURSE_DONE],
+      ]);
+    });
+
+    it("awards nothing and changes nothing when run a second time", () => {
+      const [lesson] = createLessons(base.course.id, 1);
+      enrollUser(base.user.id, base.course.id, false, false);
+      completedAt(base.user.id, lesson.id, COURSE_DONE);
+      backfillBadges();
+      const before = getBadgesForUser(base.user.id);
+
+      expect(backfillBadges()).toBe(0);
+      expect(getBadgesForUser(base.user.id)).toEqual(before);
+    });
+
+    it("gives instructors and admins no badges", () => {
+      const admin = testDb
+        .insert(schema.users)
+        .values({
+          name: "Admin",
+          email: "admin@staff.test",
+          role: schema.UserRole.Admin,
+        })
+        .returning()
+        .get();
+      const [lesson] = createLessons(base.course.id, 1);
+      for (const staffId of [base.instructor.id, admin.id]) {
+        enrollUser(staffId, base.course.id, false, false);
+        completedAt(staffId, lesson.id, COURSE_DONE);
+      }
+
+      expect(backfillBadges()).toBe(0);
+      expect(getBadgesForUser(base.instructor.id)).toEqual([]);
+      expect(getBadgesForUser(admin.id)).toEqual([]);
+    });
+
+    it("marks a finished course's enrollment complete at the time it was finished", () => {
+      const [first] = createLessons(base.course.id, 1);
+      const [second] = createLessons(base.course.id, 1);
+      enrollUser(base.user.id, base.course.id, false, false);
+      completedAt(base.user.id, first.id, MODULE_DONE);
+      completedAt(base.user.id, second.id, COURSE_DONE);
+
+      backfillBadges();
+
+      expect(findEnrollment(base.user.id, base.course.id)?.completedAt).toBe(
+        COURSE_DONE
+      );
     });
   });
 });

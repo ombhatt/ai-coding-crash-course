@@ -5,6 +5,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import * as schema from "../app/db/schema";
 import { seedDatabase, DROP_OFF_CLIFFS } from "./seed-data";
+import { backfillBadges } from "../app/services/badgeService";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -50,6 +51,9 @@ function seed() {
   console.log("Tables created.");
 
   const summary = seedDatabase(db);
+  // Badges are derived from progress, so award them from the seeded history.
+  // Row counts were taken before this ran.
+  summary.rowCounts.user_badges = backfillBadges();
 
   console.log("\n✓ Seed complete!");
   for (const [table, count] of Object.entries(summary.rowCounts)) {
