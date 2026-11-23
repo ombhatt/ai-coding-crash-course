@@ -1,4 +1,4 @@
-import { and, asc, count, eq, sql } from "drizzle-orm";
+import { and, asc, count, eq, lte, sql } from "drizzle-orm";
 import { db } from "~/db";
 import {
   courses,
@@ -17,6 +17,7 @@ import {
   STREAK_MILESTONES,
   getBadgeDefinition,
   type BadgeDefinition,
+  type BadgeProgress,
   type EarnedBadge,
 } from "~/lib/badges";
 import { weeklyStreak } from "~/lib/streak";
@@ -42,7 +43,7 @@ function getCourseForLesson(lessonId: number) {
     .get();
 }
 
-function isCourseComplete(userId: number, courseId: number) {
+function isCourseComplete(userId: number, courseId: number, asOf: string) {
   const total = db
     .select({ n: count() })
     .from(lessons)
@@ -59,7 +60,8 @@ function isCourseComplete(userId: number, courseId: number) {
       and(
         eq(modules.courseId, courseId),
         eq(lessonProgress.userId, userId),
-        eq(lessonProgress.status, LessonProgressStatus.Completed)
+        eq(lessonProgress.status, LessonProgressStatus.Completed),
+        lte(lessonProgress.completedAt, asOf)
       )
     )
     .get()!.n;
@@ -67,11 +69,17 @@ function isCourseComplete(userId: number, courseId: number) {
   return total > 0 && completed === total;
 }
 
-// Inserts the badge unless the user already has it. Returns whether it is new.
-function award(userId: number, badge: BadgeDefinition, courseId: number | null) {
+// Inserts the badge unless the user already has it. Returns the new row, or
+// undefined if the user already had it.
+function award(
+  userId: number,
+  badge: BadgeDefinition,
+  courseId: number | null,
+  earnedAt: string
+) {
   const inserted = db
     .insert(userBadges)
-    .values({ userId, badgeKey: badge.key, courseId })
+    .values({ userId, badgeKey: badge.key, courseId, earnedAt })
     .onConflictDoNothing()
     .returning()
     .get();
@@ -107,9 +115,9 @@ function toEarned(
   };
 }
 
-// Modules with at least one lesson where the user has completed every lesson.
-// Joining lessons (not left-joining) is what keeps empty modules out.
-function countFinishedModules(userId: number) {
+// Modules with at least one lesson where the user had completed every lesson
+// by `asOf`. Joining lessons (not left-joining) keeps empty modules out.
+function countFinishedModules(userId: number, asOf: string) {
   const row = db.get<{ n: number }>(sql`
     select count(*) as n from (
       select ${modules.id}
@@ -119,6 +127,7 @@ function countFinishedModules(userId: number) {
         on ${lessonProgress.lessonId} = ${lessons.id}
         and ${lessonProgress.userId} = ${userId}
         and ${lessonProgress.status} = ${LessonProgressStatus.Completed}
+        and ${lessonProgress.completedAt} <= ${asOf}
       group by ${modules.id}
       having count(distinct ${lessons.id}) = count(distinct ${lessonProgress.lessonId})
     )
@@ -131,42 +140,48 @@ function countFinishedModules(userId: number) {
 function awardMilestones(
   userId: number,
   milestones: BadgeDefinition[],
-  reached: number
+  reached: number,
+  earnedAt: string
 ): EarnedBadge[] {
   return milestones.flatMap((milestone) => {
     if (reached < milestone.threshold!) return [];
-    const row = award(userId, milestone, null);
+    const row = award(userId, milestone, null, earnedAt);
     return row ? [toEarned(milestone, row, null)] : [];
   });
 }
 
 // Badges for finishing the lesson's course; none if the course is unfinished.
 // Also marks the enrollment complete the first time the course is finished.
-function awardCourseBadges(userId: number, lessonId: number): EarnedBadge[] {
+function awardCourseBadges(
+  userId: number,
+  lessonId: number,
+  asOf: string
+): EarnedBadge[] {
   const course = getCourseForLesson(lessonId);
-  if (!course || !isCourseComplete(userId, course.id)) return [];
+  if (!course || !isCourseComplete(userId, course.id, asOf)) return [];
 
   const enrollment = findEnrollment(userId, course.id);
   if (enrollment && !enrollment.completedAt) {
-    markEnrollmentComplete(userId, course.id);
+    markEnrollmentComplete(userId, course.id, asOf);
   }
 
   const newBadges: EarnedBadge[] = [];
-  const finisher = award(userId, COURSE_FINISHER, course.id);
+  const finisher = award(userId, COURSE_FINISHER, course.id, asOf);
   if (finisher) newBadges.push(toEarned(COURSE_FINISHER, finisher, course.title));
 
   newBadges.push(
-    ...awardMilestones(userId, COURSE_MILESTONES, countFinishedCourses(userId))
+    ...awardMilestones(
+      userId,
+      COURSE_MILESTONES,
+      countFinishedCourses(userId),
+      asOf
+    )
   );
   return newBadges;
 }
 
-// The weekly streak ending at the week this lesson was completed in.
-function currentStreak(userId: number, lessonId: number) {
-  const completedAt = getLessonProgress(userId, lessonId)?.completedAt;
-  if (!completedAt) return 0;
-
-  const history = db
+function getCompletionHistory(userId: number): string[] {
+  return db
     .select({ completedAt: lessonProgress.completedAt })
     .from(lessonProgress)
     .where(
@@ -177,8 +192,38 @@ function currentStreak(userId: number, lessonId: number) {
     )
     .all()
     .flatMap((row) => (row.completedAt ? [row.completedAt] : []));
+}
 
-  return weeklyStreak(history, completedAt);
+// The weekly streak ending at the week containing `asOf`, counting only
+// completions up to `asOf`.
+function streakAsOf(userId: number, asOf: string) {
+  const history = getCompletionHistory(userId).filter((at) => at <= asOf);
+  return weeklyStreak(history, asOf);
+}
+
+// Awards what a completion at `asOf` unlocked, counting only completions up to
+// that moment and stamping new badges with it. Shared by live awarding and the
+// backfill, so both apply the same rules.
+function awardBadgesAsOf(
+  userId: number,
+  lessonId: number,
+  asOf: string
+): EarnedBadge[] {
+  return [
+    ...awardMilestones(
+      userId,
+      MODULE_MILESTONES,
+      countFinishedModules(userId, asOf),
+      asOf
+    ),
+    ...awardCourseBadges(userId, lessonId, asOf),
+    ...awardMilestones(
+      userId,
+      STREAK_MILESTONES,
+      streakAsOf(userId, asOf),
+      asOf
+    ),
+  ];
 }
 
 /**
@@ -192,15 +237,9 @@ export function awardBadgesForLessonCompletion(
 ): EarnedBadge[] {
   if (!isStudent(userId)) return [];
 
-  return [
-    ...awardMilestones(userId, MODULE_MILESTONES, countFinishedModules(userId)),
-    ...awardCourseBadges(userId, lessonId),
-    ...awardMilestones(
-      userId,
-      STREAK_MILESTONES,
-      currentStreak(userId, lessonId)
-    ),
-  ];
+  const completedAt = getLessonProgress(userId, lessonId)?.completedAt;
+  if (!completedAt) return [];
+  return awardBadgesAsOf(userId, lessonId, completedAt);
 }
 
 /** A user's earned badges, oldest first. */
@@ -223,4 +262,87 @@ export function getBadgesForUser(userId: number): EarnedBadge[] {
     const badge = getBadgeDefinition(row.badgeKey);
     return badge ? [toEarned(badge, row, row.courseTitle)] : [];
   });
+}
+
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
+// A streak is still going until a whole week is missed: if this week has no
+// completion yet, the streak that ended last week still counts.
+function liveStreak(userId: number, now: Date) {
+  const history = getCompletionHistory(userId);
+  return (
+    weeklyStreak(history, now.toISOString()) ||
+    weeklyStreak(history, new Date(now.getTime() - WEEK_MS).toISOString())
+  );
+}
+
+/**
+ * For each milestone family, the lowest level the user has not earned yet,
+ * with their current count toward it. Families with every level earned are
+ * left out, and staff (who cannot earn badges) get nothing.
+ */
+export function getBadgeProgress(userId: number, now: Date): BadgeProgress[] {
+  if (!isStudent(userId)) return [];
+
+  const held = new Set(
+    db
+      .select({ key: userBadges.badgeKey })
+      .from(userBadges)
+      .where(eq(userBadges.userId, userId))
+      .all()
+      .map((row) => row.key)
+  );
+
+  const families: [BadgeDefinition[], () => number][] = [
+    [COURSE_MILESTONES, () => countFinishedCourses(userId)],
+    [MODULE_MILESTONES, () => countFinishedModules(userId, now.toISOString())],
+    [STREAK_MILESTONES, () => liveStreak(userId, now)],
+  ];
+
+  return families.flatMap(([milestones, current]) => {
+    const next = milestones.find((m) => !held.has(m.key));
+    if (!next) return [];
+    return [
+      {
+        key: next.key,
+        family: next.family,
+        name: next.name,
+        description: next.description,
+        current: current(),
+        target: next.threshold!,
+      },
+    ];
+  });
+}
+
+/**
+ * Awards every badge students have already earned, by replaying each
+ * student's lesson completions oldest first through the live awarding rules.
+ * Badges are dated to the completion that earned them. Safe to run again:
+ * badges already held are skipped. Returns the number of badges awarded.
+ */
+export function backfillBadges(): number {
+  const completions = db
+    .select({
+      userId: lessonProgress.userId,
+      lessonId: lessonProgress.lessonId,
+      completedAt: lessonProgress.completedAt,
+    })
+    .from(lessonProgress)
+    .innerJoin(users, eq(lessonProgress.userId, users.id))
+    .where(
+      and(
+        eq(users.role, UserRole.Student),
+        eq(lessonProgress.status, LessonProgressStatus.Completed)
+      )
+    )
+    .orderBy(asc(lessonProgress.completedAt), asc(lessonProgress.id))
+    .all();
+
+  let awarded = 0;
+  for (const { userId, lessonId, completedAt } of completions) {
+    if (!completedAt) continue;
+    awarded += awardBadgesAsOf(userId, lessonId, completedAt).length;
+  }
+  return awarded;
 }

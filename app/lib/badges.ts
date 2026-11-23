@@ -111,3 +111,13 @@ export type EarnedBadge = {
   courseTitle: string | null;
   earnedAt: string;
 };
+
+// Progress toward the lowest unearned level of a milestone family.
+export type BadgeProgress = {
+  key: string;
+  family: BadgeFamily;
+  name: string;
+  description: string;
+  current: number;
+  target: number;
+};
