@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   sqliteTable,
   text,
@@ -340,3 +341,29 @@ export const videoWatchEvents = sqliteTable("video_watch_events", {
     .notNull()
     .$defaultFn(() => new Date().toISOString()),
 });
+
+// Badges are awarded once and never revoked. `badgeKey` names a definition in
+// app/lib/badges.ts; `courseId` is set only for per-course badges.
+export const userBadges = sqliteTable(
+  "user_badges",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id),
+    badgeKey: text("badge_key").notNull(),
+    courseId: integer("course_id").references(() => courses.id),
+    earnedAt: text("earned_at")
+      .notNull()
+      .$defaultFn(() => new Date().toISOString()),
+  },
+  (table) => [
+    // SQLite treats NULLs as distinct in a unique index, so a plain
+    // (user, key, course) index would allow duplicate milestone badges.
+    uniqueIndex("user_badges_user_key_course_unique").on(
+      table.userId,
+      table.badgeKey,
+      sql`coalesce(${table.courseId}, 0)`
+    ),
+  ]
+);
