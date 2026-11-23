@@ -64,6 +64,13 @@
       "when": 1795302793606,
       "tag": "0008_wide_betty_ross",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1795469420500,
+      "tag": "0009_happy_magma",
+      "breakpoints": true
     }
   ]
 }

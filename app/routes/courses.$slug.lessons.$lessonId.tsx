@@ -7,6 +7,7 @@ import {
   getCourseWithDetails,
 } from "~/services/courseService";
 import { getLessonById } from "~/services/lessonService";
+import { awardBadgesForLessonCompletion } from "~/services/badgeService";
 import { getModuleById } from "~/services/moduleService";
 import { getCurrentUserId } from "~/lib/session";
 import { getAccess, requireContentAccess } from "~/lib/access.server";
@@ -407,7 +408,8 @@ export async function action({ params, request }: Route.ActionArgs) {
 
   if (intent === "mark-complete") {
     markLessonComplete(currentUserId, lessonId);
-    return { success: true };
+    const newBadges = awardBadgesForLessonCompletion(currentUserId, lessonId);
+    return { success: true, newBadges };
   }
 
   if (intent === "submit-quiz") {
@@ -505,6 +507,17 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
 
   const isCompleted =
     lessonStatus === LessonProgressStatus.Completed || justCompleted;
+
+  const newBadges = fetcher.data?.newBadges;
+  useEffect(() => {
+    for (const badge of newBadges ?? []) {
+      toast.success(`🏅 Badge earned: ${badge.name}`, {
+        description: badge.courseTitle
+          ? `Finished ${badge.courseTitle}`
+          : badge.description,
+      });
+    }
+  }, [newBadges]);
 
   // Navigate to next lesson after marking complete
   useEffect(() => {
