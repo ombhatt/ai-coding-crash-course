@@ -1,4 +1,4 @@
-import { Award, Layers, Trophy, type LucideIcon } from "lucide-react";
+import { Award, Flame, Layers, Trophy, type LucideIcon } from "lucide-react";
 import { BadgeFamily, type EarnedBadge } from "~/lib/badges";
 import { cn } from "~/lib/utils";
 
@@ -10,6 +10,10 @@ const FAMILY_STYLE: Record<BadgeFamily, { icon: LucideIcon; className: string }>
   [BadgeFamily.Module]: {
     icon: Layers,
     className: "bg-sky-100 text-sky-700 dark:bg-sky-950 dark:text-sky-400",
+  },
+  [BadgeFamily.Streak]: {
+    icon: Flame,
+    className: "bg-orange-100 text-orange-700 dark:bg-orange-950 dark:text-orange-400",
   },
 };
 
